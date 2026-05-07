@@ -58,13 +58,17 @@ class FreeCADFaceRegion:
     * ``edge_points``/``edge_kinds``: an explicit ordered boundary with spline
       and line edges, used for adhesives, webs, and split spar faces.
 
-    ``material_name`` and ``ply_angle`` are passed through to the FreeCAD face
-    metadata so downstream tools can recover material assignments.
+    ``material_name`` is passed through to the FreeCAD face metadata so
+    downstream tools can recover material assignments.  Composite regions can
+    also carry ``laminate_name`` and ``plies`` for tools such as HomoGen that
+    assign a face to a named laminate made from ply entries.
     """
 
     name: str
     material_name: str
     ply_angle: float
+    laminate_name: str = None
+    plies: list = None
     points: np.ndarray = None
     outer_points: np.ndarray = None
     inner_points: np.ndarray = None
@@ -303,8 +307,12 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
     """Create one FreeCAD object from a pyNuMAD cross-section data object.
 
     Detailed sections become a sewn shell with one face per material region.
-    The returned object gets a ``FaceMaterialMap`` JSON string property whose
-    entries are ordered to match ``obj.Shape.Faces``.
+    The returned object gets two JSON string properties:
+
+    * ``FaceMaterialMap``: one entry per ``obj.Shape.Faces`` item, with each
+      face assigned to either a material or a named laminate;
+    * ``LaminateDefinitions``: unique laminate ply stacks referenced by
+      ``FaceMaterialMap[*]["assignment_name"]``.
     """
 
     App, Part = _require_freecad_modules()
@@ -333,6 +341,13 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
             group="pyNuMAD",
             description="JSON map from face index to material metadata",
         )
+        _set_string_property(
+            section_obj,
+            "LaminateDefinitions",
+            json.dumps(laminate_definitions(section.regions)),
+            group="pyNuMAD",
+            description="JSON table of unique laminate ply stacks",
+        )
         _set_view_color(section_obj, (0.78, 0.82, 0.86, 0.0))
         return section_obj
 
@@ -348,22 +363,71 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
 
 
 def face_material_metadata(regions):
-    """Return face-index/material metadata for serialized or object regions."""
+    """Return face-index/material metadata for serialized or object regions.
+
+    Laminate faces reference the table returned by
+    :func:`laminate_definitions` through ``assignment_name``.  The full ply
+    stack is intentionally stored once in that table rather than repeated for
+    each face.
+    """
 
     metadata = []
+    laminate_table = laminate_definitions(regions)
+    laminate_index_by_key = {
+        _laminate_key(item["plies"]): item["laminate_index"]
+        for item in laminate_table
+    }
     for index, region in enumerate(regions or []):
         region_name = _region_value(region, "name")
+        plies = _region_value(region, "plies") or []
+        laminate_index = laminate_index_by_key.get(_laminate_key(plies)) if plies else None
+        assignment_type = "laminate" if laminate_index is not None else "material"
+        assignment_name = (
+            laminate_table[laminate_index]["laminate_name"]
+            if laminate_index is not None
+            else _region_value(region, "material_name")
+        )
         item = _parsed_region_name(region_name)
         item.update(
             dict(
                 face_index=index,
                 region_name=region_name,
                 material_name=_region_value(region, "material_name"),
-                ply_angle=_region_value(region, "ply_angle"),
+                assignment_type=assignment_type,
+                assignment_name=assignment_name,
             )
         )
         metadata.append(item)
     return metadata
+
+
+def laminate_definitions(regions):
+    """Return unique laminate definitions referenced by face metadata.
+
+    Faces often share identical ply stacks.  This table deduplicates those
+    stacks by ply material, angle, and thickness and assigns a compact integer
+    index for HomoGen-style face assignments.
+    """
+
+    definitions = []
+    index_by_key = {}
+    for region in regions or []:
+        plies = _region_value(region, "plies") or []
+        if not plies:
+            continue
+        key = _laminate_key(plies)
+        if key in index_by_key:
+            continue
+        laminate_index = len(definitions)
+        index_by_key[key] = laminate_index
+        definitions.append(
+            {
+                "laminate_index": laminate_index,
+                "laminate_name": f"Laminate{laminate_index:03d}",
+                "plies": plies,
+            }
+        )
+    return definitions
 
 
 class _StationTransformer:
@@ -777,6 +841,8 @@ def _shell_regions_from_stack(stack, station, side, outer_points, section, trans
                 name=f"Station{station:03d}_{side}_{stack.name}_layer{i_layer:02d}",
                 material_name=plygroup.materialid,
                 ply_angle=plygroup.angle,
+                laminate_name=_laminate_name(station, side, stack.name, i_layer),
+                plies=_plies_from_plygroup(plygroup, transformer),
                 outer_points=current_outer,
                 inner_points=inner_points,
             )
@@ -889,6 +955,13 @@ def _perimeter_shell_regions(stacks, sides, segments, station, section, transfor
                     name=f"Station{station:03d}_{sides[i_segment]}_{_shell_region_stack_name(stack, sides, stack_name_counts, i_segment)}_layer{i_layer:02d}",
                     material_name=plygroup.materialid,
                     ply_angle=plygroup.angle,
+                    laminate_name=_laminate_name(
+                        station,
+                        sides[i_segment],
+                        _shell_region_stack_name(stack, sides, stack_name_counts, i_segment),
+                        i_layer,
+                    ),
+                    plies=_plies_from_plygroup(plygroup, transformer),
                     outer_points=outer_segment,
                     inner_points=inner_segment,
                     start_connector=start_connector,
@@ -1398,6 +1471,8 @@ def _leading_edge_shell_regions(hp_stack, lp_stack, station, hp_outer_points, lp
                 name=f"Station{station:03d}_HP_{hp_stack.name}_layer{i_layer:02d}",
                 material_name=hp_plygroup.materialid,
                 ply_angle=hp_plygroup.angle,
+                laminate_name=_laminate_name(station, "HP", hp_stack.name, i_layer),
+                plies=_plies_from_plygroup(hp_plygroup, transformer),
                 outer_points=current_hp_outer,
                 inner_points=current_hp_inner,
             )
@@ -1407,6 +1482,8 @@ def _leading_edge_shell_regions(hp_stack, lp_stack, station, hp_outer_points, lp
                 name=f"Station{station:03d}_LP_{lp_stack.name}_layer{i_layer:02d}",
                 material_name=lp_plygroup.materialid,
                 ply_angle=lp_plygroup.angle,
+                laminate_name=_laminate_name(station, "LP", lp_stack.name, i_layer),
+                plies=_plies_from_plygroup(lp_plygroup, transformer),
                 outer_points=current_lp_outer,
                 inner_points=current_lp_inner,
             )
@@ -1470,7 +1547,7 @@ def _web_regions(blade, station, transformer, cs_params, shell_regions):
         hp_interface_edges.append(_join_connected_edges(_connected_edge_order(hp_adhesive_edges, hp_web_edges)[0]))
         lp_interface_edges.append(_join_connected_edges(_connected_edge_order(lp_adhesive_edges, lp_web_edges)[0]))
 
-        regions.extend(_web_laminate_regions(station, i_web, hp_web_edges, lp_web_edges, web_stack))
+        regions.extend(_web_laminate_regions(station, i_web, hp_web_edges, lp_web_edges, web_stack, transformer))
         regions.extend(
             _web_adhesive_regions_from_edges(
                 station,
@@ -1675,7 +1752,7 @@ def _split_region_inner_edge_for_interfaces(region, interface_edges):
     region.edge_kinds.append("line")
 
 
-def _web_laminate_regions(station, i_web, hp_edges, lp_edges, web_stack):
+def _web_laminate_regions(station, i_web, hp_edges, lp_edges, web_stack, transformer):
     """Create one web laminate face per nonzero web plygroup."""
 
     regions = []
@@ -1692,6 +1769,8 @@ def _web_laminate_regions(station, i_web, hp_edges, lp_edges, web_stack):
                 name=f"Station{station:03d}_web{i_web}_layer{i_layer:02d}",
                 material_name=plygroup.materialid,
                 ply_angle=plygroup.angle,
+                laminate_name=_laminate_name(station, f"web{i_web}", "SW", i_layer),
+                plies=_plies_from_plygroup(plygroup, transformer),
                 edge_points=_web_face_edges(hp_edge, lp_edge),
                 edge_kinds=["spline", "line", "spline", "line"],
             )
@@ -2100,6 +2179,55 @@ def _station_value(values, station, default=0.0):
         return float(values)
 
 
+def _laminate_name(station, side, stack_name, i_layer):
+    """Return a stable laminate name for a generated plygroup face."""
+
+    return f"Station{station:03d}_{side}_{stack_name}_layer{i_layer:02d}_laminate"
+
+
+def _plies_from_plygroup(plygroup, transformer):
+    """Expand a pyNuMAD plygroup into HomoGen-style ply entries.
+
+    pyNuMAD consolidates consecutive plies with the same material and angle into
+    one plygroup.  HomoGen expects the laminate definition as an ordered list of
+    plies, so repeated plies are expanded here.  ``thickness`` is in the same
+    units as the exported FreeCAD geometry.
+    Core, coating, resin, and adhesive-like plygroups are returned as ``None`` so
+    their faces remain direct material assignments instead of laminate entries.
+    """
+
+    if not _plygroup_is_laminate(plygroup):
+        return None
+
+    n_plies = int(plygroup.nPlies or 0)
+    if n_plies <= 0:
+        return []
+
+    thickness = float(transformer.length_from_mm(plygroup.thickness))
+    return [
+        {
+            "material": plygroup.materialid,
+            "angle": float(plygroup.angle),
+            "thickness": thickness,
+        }
+        for _ in range(n_plies)
+    ]
+
+
+def _plygroup_is_laminate(plygroup):
+    """Return whether a plygroup should be exported as a laminate definition."""
+
+    material_name = str(plygroup.materialid).lower()
+    non_laminate_markers = ("foam", "core", "gelcoat", "adhesive", "resin")
+    return not any(marker in material_name for marker in non_laminate_markers)
+
+
+def _laminate_key(plies):
+    """Return a deterministic key for comparing laminate ply stacks."""
+
+    return json.dumps(plies, sort_keys=True, separators=(",", ":"))
+
+
 def _require_freecad_modules():
     """Import FreeCAD modules or raise a targeted setup error."""
 
@@ -2290,32 +2418,38 @@ def _region_value(region, key):
 
 
 def _parsed_region_name(name):
-    """Parse generated region names into metadata fields for downstream tools."""
+    """Parse generated region names into a fixed snake_case metadata schema."""
 
     parts = name.split("_")
-    parsed = dict(RegionName=name)
+    parsed = dict(
+        station=None,
+        layer=None,
+        side=None,
+        stack_index=None,
+        stack_name=None,
+        component_name=None,
+        web_index=None,
+    )
     if parts and parts[0].startswith("Station"):
-        parsed["Station"] = int(parts[0].replace("Station", ""))
+        parsed["station"] = int(parts[0].replace("Station", ""))
 
     layer_index = next((index for index, part in enumerate(parts) if part.startswith("layer")), None)
     if layer_index is not None:
-        parsed["Layer"] = int(parts[layer_index].replace("layer", ""))
+        parsed["layer"] = int(parts[layer_index].replace("layer", ""))
 
     if len(parts) > 1 and parts[1] in ("HP", "LP"):
-        parsed["Side"] = parts[1]
+        parsed["side"] = parts[1]
         if len(parts) > 2:
-            parsed["StackIndex"] = parts[2]
+            parsed["stack_index"] = parts[2]
         if layer_index is not None:
-            parsed["StackName"] = "_".join(parts[2:layer_index])
-            parsed["ComponentName"] = "_".join(parts[3:layer_index])
+            parsed["stack_name"] = "_".join(parts[2:layer_index])
+            parsed["component_name"] = "_".join(parts[3:layer_index])
         return parsed
 
     if len(parts) > 1 and parts[1].startswith("web"):
-        parsed["Feature"] = "web"
-        parsed["WebIndex"] = int(parts[1].replace("web", ""))
+        parsed["web_index"] = int(parts[1].replace("web", ""))
         if len(parts) > 2 and parts[2] in ("hp", "lp"):
-            parsed["Side"] = parts[2].upper()
-            parsed["IsAdhesive"] = "adhesive" in parts
+            parsed["side"] = parts[2].upper()
         return parsed
 
     return parsed
@@ -2331,6 +2465,10 @@ def _serialize_regions(regions):
             "material_name": region.material_name,
             "ply_angle": region.ply_angle,
         }
+        if region.laminate_name is not None:
+            item["laminate_name"] = region.laminate_name
+        if region.plies is not None:
+            item["plies"] = region.plies
         if region.points is not None:
             item["points"] = region.points.tolist()
         if region.outer_points is not None:
@@ -2461,29 +2599,35 @@ def stitched_section_shape(faces):
 
 def parsed_region_name(name):
     parts = name.split("_")
-    parsed = dict(RegionName=name)
+    parsed = dict(
+        station=None,
+        layer=None,
+        side=None,
+        stack_index=None,
+        stack_name=None,
+        component_name=None,
+        web_index=None,
+    )
     if parts and parts[0].startswith("Station"):
-        parsed["Station"] = int(parts[0].replace("Station", ""))
+        parsed["station"] = int(parts[0].replace("Station", ""))
 
     layer_index = next((index for index, part in enumerate(parts) if part.startswith("layer")), None)
     if layer_index is not None:
-        parsed["Layer"] = int(parts[layer_index].replace("layer", ""))
+        parsed["layer"] = int(parts[layer_index].replace("layer", ""))
 
     if len(parts) > 1 and parts[1] in ("HP", "LP"):
-        parsed["Side"] = parts[1]
+        parsed["side"] = parts[1]
         if len(parts) > 2:
-            parsed["StackIndex"] = parts[2]
+            parsed["stack_index"] = parts[2]
         if layer_index is not None:
-            parsed["StackName"] = "_".join(parts[2:layer_index])
-            parsed["ComponentName"] = "_".join(parts[3:layer_index])
+            parsed["stack_name"] = "_".join(parts[2:layer_index])
+            parsed["component_name"] = "_".join(parts[3:layer_index])
         return parsed
 
     if len(parts) > 1 and parts[1].startswith("web"):
-        parsed["Feature"] = "web"
-        parsed["WebIndex"] = int(parts[1].replace("web", ""))
+        parsed["web_index"] = int(parts[1].replace("web", ""))
         if len(parts) > 2 and parts[2] in ("hp", "lp"):
-            parsed["Side"] = parts[2].upper()
-            parsed["IsAdhesive"] = "adhesive" in parts
+            parsed["side"] = parts[2].upper()
         return parsed
 
     return parsed
@@ -2491,18 +2635,54 @@ def parsed_region_name(name):
 
 def face_metadata(regions):
     metadata = []
+    laminate_table = laminate_definitions(regions)
+    laminate_index_by_key = {{
+        laminate_key(item["plies"]): item["laminate_index"]
+        for item in laminate_table
+    }}
     for index, region in enumerate(regions):
+        plies = region.get("plies", [])
+        laminate_index = laminate_index_by_key.get(laminate_key(plies)) if plies else None
+        assignment_type = "laminate" if laminate_index is not None else "material"
+        assignment_name = laminate_table[laminate_index]["laminate_name"] if laminate_index is not None else region["material_name"]
         item = parsed_region_name(region["name"])
         item.update(
             dict(
                 face_index=index,
                 region_name=region["name"],
                 material_name=region["material_name"],
-                ply_angle=region["ply_angle"],
+                assignment_type=assignment_type,
+                assignment_name=assignment_name,
             )
         )
         metadata.append(item)
     return metadata
+
+
+def laminate_definitions(regions):
+    definitions = []
+    index_by_key = {{}}
+    for region in regions:
+        plies = region.get("plies", [])
+        if not plies:
+            continue
+        key = laminate_key(plies)
+        if key in index_by_key:
+            continue
+        laminate_index = len(definitions)
+        index_by_key[key] = laminate_index
+        definitions.append(
+            {{
+                "laminate_index": laminate_index,
+                "laminate_name": "Laminate{{:03d}}".format(laminate_index),
+                "plies": plies,
+            }}
+        )
+    return definitions
+
+
+def laminate_key(plies):
+    return json.dumps(plies, sort_keys=True, separators=(",", ":"))
 
 
 def color_for_material(material_name):
@@ -2547,6 +2727,8 @@ for section in DATA["sections"]:
         stitched_obj.Label = "Station {{:03d}} stitched section".format(station)
         stitched_obj.addProperty("App::PropertyString", "FaceMaterialMap", "pyNuMAD", "JSON map from face index to material metadata")
         stitched_obj.FaceMaterialMap = json.dumps(face_metadata(section["regions"]))
+        stitched_obj.addProperty("App::PropertyString", "LaminateDefinitions", "pyNuMAD", "JSON table of unique laminate ply stacks")
+        stitched_obj.LaminateDefinitions = json.dumps(laminate_definitions(section["regions"]))
         if hasattr(stitched_obj, "ViewObject") and stitched_obj.ViewObject is not None:
             stitched_obj.ViewObject.ShapeColor = (0.78, 0.82, 0.86, 0.0)
         created.append(stitched_obj)

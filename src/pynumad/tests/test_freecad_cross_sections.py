@@ -5,6 +5,7 @@ from pynumad.analysis.freecad import (
     face_material_metadata,
     get_cross_section,
     get_detailed_cross_section,
+    laminate_definitions,
     make_freecad_cross_section_parts,
     make_freecad_section_part,
     write_freecad_cross_sections,
@@ -70,19 +71,112 @@ def test_face_material_metadata_splits_region_name_fields():
     metadata = face_material_metadata(section.regions)
 
     assert len(metadata) == len(section.regions)
-    shell_item = next(item for item in metadata if item["region_name"].startswith("Station010_HP_03_"))
-    assert shell_item["Station"] == 10
-    assert shell_item["Side"] == "HP"
-    assert shell_item["Layer"] >= 0
-    assert shell_item["StackIndex"] == "03"
+    shell_item = next(
+        item
+        for item in metadata
+        if item["region_name"].startswith("Station010_HP_03_") and item["assignment_type"] == "laminate"
+    )
+    assert shell_item["station"] == 10
+    assert shell_item["side"] == "HP"
+    assert shell_item["layer"] >= 0
+    assert shell_item["stack_index"] == "03"
+    assert shell_item["web_index"] is None
     assert shell_item["material_name"]
+    assert shell_item["assignment_type"] == "laminate"
+    assert shell_item["assignment_name"].startswith("Laminate")
+    assert "plies" not in shell_item
 
     adhesive_item = next(item for item in metadata if item["region_name"] == "Station010_web0_hp_adhesive")
-    assert adhesive_item["Station"] == 10
-    assert adhesive_item["Feature"] == "web"
-    assert adhesive_item["WebIndex"] == 0
-    assert adhesive_item["Side"] == "HP"
-    assert adhesive_item["IsAdhesive"] is True
+    assert adhesive_item["station"] == 10
+    assert adhesive_item["web_index"] == 0
+    assert adhesive_item["side"] == "HP"
+    assert adhesive_item["stack_index"] is None
+    assert adhesive_item["stack_name"] is None
+    assert adhesive_item["component_name"] is None
+    assert adhesive_item["assignment_type"] == "material"
+    assert adhesive_item["assignment_name"] == adhesive_item["material_name"]
+
+
+def test_face_material_metadata_uses_fixed_snake_case_schema():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 7, move_le_to_origin=True)
+    metadata = face_material_metadata(section.regions)
+    expected_keys = {
+        "station",
+        "layer",
+        "side",
+        "stack_index",
+        "stack_name",
+        "component_name",
+        "web_index",
+        "face_index",
+        "region_name",
+        "material_name",
+        "assignment_type",
+        "assignment_name",
+    }
+
+    assert metadata
+    assert all(set(item) == expected_keys for item in metadata)
+    assert all(key == key.lower() for key in expected_keys)
+    assert all("_" in key or key in {"side", "layer", "station"} for key in expected_keys)
+    assert all("RegionName" not in item and "Feature" not in item for item in metadata)
+
+
+def test_face_material_metadata_expands_repeated_plygroups_for_homogen():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 5, move_le_to_origin=True)
+    metadata = face_material_metadata(section.regions)
+    laminates = laminate_definitions(section.regions)
+    laminates_by_name = {laminate["laminate_name"]: laminate for laminate in laminates}
+    repeated = next(
+        item
+        for item in metadata
+        if item["assignment_type"] == "laminate" and len(laminates_by_name[item["assignment_name"]]["plies"]) > 1
+    )
+    repeated_laminate = laminates_by_name[repeated["assignment_name"]]
+
+    assert repeated["assignment_type"] == "laminate"
+    assert repeated["assignment_name"] == repeated_laminate["laminate_name"]
+    assert len(repeated_laminate["plies"]) > 1
+    assert len({ply["material"] for ply in repeated_laminate["plies"]}) == 1
+    assert len({ply["angle"] for ply in repeated_laminate["plies"]}) == 1
+    assert all(ply["thickness"] > 0 for ply in repeated_laminate["plies"])
+    assert all(set(ply) == {"material", "angle", "thickness"} for ply in repeated_laminate["plies"])
+
+
+def test_laminate_definitions_deduplicate_shared_ply_stacks():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    metadata = face_material_metadata(section.regions)
+    laminates = laminate_definitions(section.regions)
+    laminate_face_count = sum(1 for item in metadata if item["assignment_type"] == "laminate")
+    laminate_names = {item["laminate_name"] for item in laminates}
+
+    assert laminates
+    assert len(laminates) < laminate_face_count
+    assert [item["laminate_index"] for item in laminates] == list(range(len(laminates)))
+    assert all(item["assignment_name"] in laminate_names for item in metadata if item["assignment_type"] == "laminate")
+
+
+def test_foam_core_faces_are_material_assignments_not_laminates():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 7, move_le_to_origin=True)
+    metadata = face_material_metadata(section.regions)
+    laminates = laminate_definitions(section.regions)
+    foam_faces = [item for item in metadata if item["material_name"] == "medium_density_foam"]
+
+    assert foam_faces
+    assert all(item["assignment_type"] == "material" for item in foam_faces)
+    assert all(item["assignment_name"] == "medium_density_foam" for item in foam_faces)
+    assert all(
+        all(ply["material"] != "medium_density_foam" for ply in laminate["plies"])
+        for laminate in laminates
+    )
 
 
 def test_detailed_webs_connect_spar_boundaries():
@@ -382,8 +476,9 @@ def test_write_detailed_freecad_cross_sections_script(tmp_path):
     assert "sewShape" in contents
     assert "FaceMaterialMap" in contents
     assert "face_index" in contents
-    assert '"Station"' in contents
-    assert '"Side"' in contents
+    assert '"station"' in contents
+    assert '"side"' in contents
+    assert '"web_index"' in contents
     assert "_section" in contents
     assert '"debug_faces": false' in contents
     assert '"start_connector": [' in contents
