@@ -39,6 +39,14 @@ class Material:
         Cured mass density [kg/m2]
     drydensity : float
         Density of fabric
+    thermal_expansion : float or list
+        Coefficient of thermal expansion [1/K], when provided by input data.
+    thermal_conductivity : float or list
+        Thermal conductivity [W/m/K], when provided by input data.
+    specific_heat : float
+        Specific heat [J/kg/K], when provided by input data.
+    thermal_reference_temperature : float
+        Reference temperature [K], when provided by input data.
     uts : float
         1 x 3 array of ultimate tensile strength design values.
         Sequence: SL , ST, Sz, 1 x 1 for isotropic.
@@ -88,6 +96,10 @@ class Material:
     prxz: Optional[float] = None
     density: Optional[float] = None
     drydensity: Optional[float] = None
+    thermal_expansion: Optional[float] = None
+    thermal_conductivity: Optional[float] = None
+    specific_heat: Optional[float] = None
+    thermal_reference_temperature: Optional[float] = None
     uts: Optional[float] = None
     ucs: Optional[float] = None
     uss: Optional[float] = None

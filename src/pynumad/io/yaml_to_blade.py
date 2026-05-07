@@ -324,6 +324,31 @@ def _add_materials(definition, material_data):
         cur_mat.density = material_data[i]["rho"]
         # cur_mat.dens = mat_data[i]['rho']
         cur_mat.drydensity = material_data[i]["rho"]
+        cur_mat.thermal_expansion = _optional_material_value(
+            material_data[i],
+            "alpha",
+            "thermal_expansion",
+            "thermal_expansion_coefficient",
+            "ThermalExpansionCoefficient",
+        )
+        cur_mat.thermal_conductivity = _optional_material_value(
+            material_data[i],
+            "k",
+            "K",
+            "thermal_conductivity",
+            "ThermalConductivity",
+        )
+        cur_mat.specific_heat = _optional_material_value(
+            material_data[i],
+            "cp",
+            "specific_heat",
+            "SpecificHeat",
+        )
+        cur_mat.thermal_reference_temperature = _optional_material_value(
+            material_data[i],
+            "thermal_reference_temperature",
+            "ThermalExpansionReferenceTemperature",
+        )
         if (
             "description" in material_data[i].keys()
             and "source" in material_data[i].keys()
@@ -340,6 +365,13 @@ def _add_materials(definition, material_data):
         materials_dict[cur_mat.name] = cur_mat
     definition.materials = materials_dict
     return
+
+
+def _optional_material_value(material, *keys):
+    for key in keys:
+        if key in material:
+            return _parse_data(material[key])
+    return None
 
 
 def _add_components(definition, blade_internal_structure, blade_structure_dict):

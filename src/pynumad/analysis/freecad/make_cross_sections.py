@@ -83,6 +83,7 @@ class FreeCADDetailedCrossSection(FreeCADCrossSection):
     """Detailed station data with shell, web, and adhesive face regions."""
 
     regions: list = None
+    material_definitions: list = None
 
 
 def get_cross_section(
@@ -180,6 +181,7 @@ def get_detailed_cross_section(
         hp_points=section.hp_points,
         lp_points=section.lp_points,
         regions=regions,
+        material_definitions=material_definitions(blade),
     )
 
 
@@ -236,6 +238,7 @@ def write_freecad_cross_sections(
         "export_step": export_step,
         "fcstd_path": os.fspath(out_dir / f"{wt_name}_cross_sections.FCStd"),
         "step_path": os.fspath(out_dir / f"{wt_name}_cross_sections.step"),
+        "material_definitions": material_definitions(blade) if detailed else [],
         "sections": [
             {
                 "station": section.station,
@@ -312,7 +315,9 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
     * ``FaceMaterialMap``: one entry per ``obj.Shape.Faces`` item, with each
       face assigned to either a material or a named laminate;
     * ``LaminateDefinitions``: unique laminate ply stacks referenced by
-      ``FaceMaterialMap[*]["assignment_name"]``.
+      ``FaceMaterialMap[*]["assignment_name"]``;
+    * ``MaterialDefinitions``: project-local material properties referenced by
+      material assignments and laminate ply entries.
     """
 
     App, Part = _require_freecad_modules()
@@ -338,15 +343,22 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
             section_obj,
             "FaceMaterialMap",
             json.dumps(face_material_metadata(section.regions)),
-            group="pyNuMAD",
+            group="Turbine",
             description="JSON map from face index to material metadata",
         )
         _set_string_property(
             section_obj,
             "LaminateDefinitions",
             json.dumps(laminate_definitions(section.regions)),
-            group="pyNuMAD",
+            group="Turbine",
             description="JSON table of unique laminate ply stacks",
+        )
+        _set_string_property(
+            section_obj,
+            "MaterialDefinitions",
+            json.dumps(getattr(section, "material_definitions", None) or []),
+            group="Turbine",
+            description="JSON table of material properties from pyNuMAD",
         )
         _set_view_color(section_obj, (0.78, 0.82, 0.86, 0.0))
         return section_obj
@@ -428,6 +440,101 @@ def laminate_definitions(regions):
             }
         )
     return definitions
+
+
+def material_definitions(blade):
+    """Return project-local material property definitions for HomoGen.
+
+    The table uses SI units from pyNuMAD/YAML: density in ``kg/m^3``, elastic
+    moduli in ``Pa``, thermal expansion in ``1/K``, thermal conductivity in
+    ``W/m/K``, specific heat in ``J/kg/K``, and reference temperature in ``K``.
+    Only thermal fields present in the input data are emitted.
+    """
+
+    materials = getattr(getattr(blade, "definition", None), "materials", {}) or {}
+    material_iter = materials.values() if isinstance(materials, dict) else materials
+    definitions = []
+    for material in material_iter:
+        item = {
+            "material_name": material.name,
+            "material_type": material.type,
+            "density": _json_value(material.density),
+            "elastic": _elastic_definition(material),
+        }
+
+        thermal = _thermal_definition(material)
+        if thermal:
+            item["thermal"] = thermal
+
+        strength = _strength_definition(material)
+        if strength:
+            item["strength"] = strength
+
+        fracture = _fracture_definition(material)
+        if fracture:
+            item["fracture"] = fracture
+
+        definitions.append(item)
+    return definitions
+
+
+def _elastic_definition(material):
+    if material.type == "orthotropic":
+        return {
+            "e1": _json_value(material.ex),
+            "e2": _json_value(material.ey),
+            "e3": _json_value(material.ez),
+            "g12": _json_value(material.gxy),
+            "g13": _json_value(material.gxz),
+            "g23": _json_value(material.gyz),
+            "nu12": _json_value(material.prxy),
+            "nu13": _json_value(material.prxz),
+            "nu23": _json_value(material.pryz),
+        }
+    return {
+        "youngs_modulus": _json_value(material.ex),
+        "shear_modulus": _json_value(material.gxy),
+        "poisson_ratio": _json_value(material.prxy),
+    }
+
+
+def _thermal_definition(material):
+    fields = {
+        "expansion_coefficient": getattr(material, "thermal_expansion", None),
+        "conductivity": getattr(material, "thermal_conductivity", None),
+        "specific_heat": getattr(material, "specific_heat", None),
+        "reference_temperature": getattr(material, "thermal_reference_temperature", None),
+    }
+    return {
+        key: _json_value(value)
+        for key, value in fields.items()
+        if value is not None
+    }
+
+
+def _strength_definition(material):
+    fields = {
+        "tensile": material.uts,
+        "compressive": _abs_json_value(material.ucs),
+        "shear": material.uss,
+    }
+    return {
+        key: _json_value(value)
+        for key, value in fields.items()
+        if value is not None
+    }
+
+
+def _fracture_definition(material):
+    fields = {
+        "g1g2": material.g1g2,
+        "alp0": material.alp0,
+    }
+    return {
+        key: _json_value(value)
+        for key, value in fields.items()
+        if value is not None and not _is_nan(value)
+    }
 
 
 class _StationTransformer:
@@ -2179,6 +2286,36 @@ def _station_value(values, station, default=0.0):
         return float(values)
 
 
+def _json_value(value):
+    """Return a JSON-safe scalar/list representation for NumPy/Python values."""
+
+    if isinstance(value, np.ndarray):
+        return [_json_value(item) for item in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, np.generic):
+        return _json_value(value.item())
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    return value
+
+
+def _abs_json_value(value):
+    converted = _json_value(value)
+    if isinstance(converted, list):
+        return [_abs_json_value(item) for item in converted]
+    if isinstance(converted, (int, float)):
+        return abs(converted)
+    return converted
+
+
+def _is_nan(value):
+    try:
+        return bool(np.isnan(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _laminate_name(station, side, stack_name, i_layer):
     """Return a stable laminate name for a generated plygroup face."""
 
@@ -2725,10 +2862,12 @@ for section in DATA["sections"]:
         stitched_obj = doc.addObject("Part::Feature", "Station{{:03d}}_section".format(station))
         stitched_obj.Shape = stitched_section_shape(section_faces)
         stitched_obj.Label = "Station {{:03d}} stitched section".format(station)
-        stitched_obj.addProperty("App::PropertyString", "FaceMaterialMap", "pyNuMAD", "JSON map from face index to material metadata")
+        stitched_obj.addProperty("App::PropertyString", "FaceMaterialMap", "Turbine", "JSON map from face index to material metadata")
         stitched_obj.FaceMaterialMap = json.dumps(face_metadata(section["regions"]))
-        stitched_obj.addProperty("App::PropertyString", "LaminateDefinitions", "pyNuMAD", "JSON table of unique laminate ply stacks")
+        stitched_obj.addProperty("App::PropertyString", "LaminateDefinitions", "Turbine", "JSON table of unique laminate ply stacks")
         stitched_obj.LaminateDefinitions = json.dumps(laminate_definitions(section["regions"]))
+        stitched_obj.addProperty("App::PropertyString", "MaterialDefinitions", "Turbine", "JSON table of material properties from pyNuMAD")
+        stitched_obj.MaterialDefinitions = json.dumps(DATA["material_definitions"])
         if hasattr(stitched_obj, "ViewObject") and stitched_obj.ViewObject is not None:
             stitched_obj.ViewObject.ShapeColor = (0.78, 0.82, 0.86, 0.0)
         created.append(stitched_obj)

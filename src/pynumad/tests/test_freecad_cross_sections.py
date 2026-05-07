@@ -6,6 +6,7 @@ from pynumad.analysis.freecad import (
     get_cross_section,
     get_detailed_cross_section,
     laminate_definitions,
+    material_definitions,
     make_freecad_cross_section_parts,
     make_freecad_section_part,
     write_freecad_cross_sections,
@@ -177,6 +178,23 @@ def test_foam_core_faces_are_material_assignments_not_laminates():
         all(ply["material"] != "medium_density_foam" for ply in laminate["plies"])
         for laminate in laminates
     )
+
+
+def test_material_definitions_include_elastic_density_and_thermal_data():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    materials = material_definitions(blade)
+    by_name = {item["material_name"]: item for item in materials}
+
+    assert by_name["glass_triax"]["material_type"] == "orthotropic"
+    assert by_name["glass_triax"]["density"] == 1940.0
+    assert by_name["glass_triax"]["elastic"]["e1"] == 28211400000.0
+    assert by_name["glass_triax"]["elastic"]["g23"] == 3491240000.0
+    assert by_name["Gelcoat"]["material_type"] == "isotropic"
+    assert by_name["Gelcoat"]["elastic"]["youngs_modulus"] == 3440000000.0
+    assert by_name["Gelcoat"]["thermal"]["expansion_coefficient"] == 0.0
+    assert by_name["Gelcoat"]["strength"]["compressive"] == 10000000000.0
+    assert "thermal" not in by_name["glass_triax"]
 
 
 def test_detailed_webs_connect_spar_boundaries():
@@ -475,6 +493,8 @@ def test_write_detailed_freecad_cross_sections_script(tmp_path):
     assert "face_between_curves" in contents
     assert "sewShape" in contents
     assert "FaceMaterialMap" in contents
+    assert "LaminateDefinitions" in contents
+    assert "MaterialDefinitions" in contents
     assert "face_index" in contents
     assert '"station"' in contents
     assert '"side"' in contents
