@@ -1799,16 +1799,43 @@ def _freecad_face_from_points(points, App, Part):
 
 def _freecad_face_between_curves(outer_points, inner_points, App, Part, start_connector=None, end_connector=None):
     outer_edge = _freecad_bspline_edge(outer_points, App, Part)
-    inner_edge = _freecad_bspline_edge(list(reversed(inner_points)), App, Part)
     if start_connector is None:
         start_connector = [inner_points[0], outer_points[0]]
     if end_connector is None:
         end_connector = [outer_points[-1], inner_points[-1]]
+    if _connector_is_straight(start_connector) and _connector_is_straight(end_connector):
+        # FreeCAD can occasionally fill long, thin spline wires with a spurious
+        # rectangular face; a ruled surface keeps these strip regions bounded by
+        # the intended inner and outer curves.
+        inner_edge = _freecad_bspline_edge(inner_points, App, Part)
+        try:
+            return Part.makeRuledSurface(outer_edge, inner_edge)
+        except Exception:
+            pass
+
+    inner_edge = _freecad_bspline_edge(list(reversed(inner_points)), App, Part)
     edges = [outer_edge]
     edges.extend(_freecad_line_edges(end_connector, App, Part))
     edges.append(inner_edge)
     edges.extend(_freecad_line_edges(start_connector, App, Part))
     return Part.Face(Part.Wire(edges))
+
+
+def _connector_is_straight(points, tolerance=1e-7):
+    points = np.asarray(points, dtype=float)
+    if len(points) <= 2:
+        return True
+    start = points[0]
+    end = points[-1]
+    segment = end - start
+    length = np.linalg.norm(segment[:2])
+    if length <= tolerance:
+        return False
+    for point in points[1:-1]:
+        distance = abs(np.cross(segment[:2], (point - start)[:2])) / length
+        if distance > tolerance:
+            return False
+    return True
 
 
 def _freecad_face_from_edge_points(edge_points, edge_kinds, App, Part):
@@ -1977,16 +2004,43 @@ def line_edges(points):
 
 def face_between_curves(outer_points, inner_points, start_connector=None, end_connector=None):
     outer_edge = bspline_edge(outer_points)
-    inner_edge = bspline_edge(list(reversed(inner_points)))
     if start_connector is None:
         start_connector = [inner_points[0], outer_points[0]]
     if end_connector is None:
         end_connector = [outer_points[-1], inner_points[-1]]
+    if connector_is_straight(start_connector) and connector_is_straight(end_connector):
+        # FreeCAD can occasionally fill long, thin spline wires with a spurious
+        # rectangular face; a ruled surface keeps these strip regions bounded by
+        # the intended inner and outer curves.
+        inner_edge = bspline_edge(inner_points)
+        try:
+            return Part.makeRuledSurface(outer_edge, inner_edge)
+        except Exception:
+            pass
+
+    inner_edge = bspline_edge(list(reversed(inner_points)))
     edges = [outer_edge]
     edges.extend(line_edges(end_connector))
     edges.append(inner_edge)
     edges.extend(line_edges(start_connector))
     return Part.Face(Part.Wire(edges))
+
+
+def connector_is_straight(points, tolerance=1e-7):
+    if len(points) <= 2:
+        return True
+    start = points[0]
+    end = points[-1]
+    segment = [end[0] - start[0], end[1] - start[1]]
+    length = (segment[0] ** 2 + segment[1] ** 2) ** 0.5
+    if length <= tolerance:
+        return False
+    for point in points[1:-1]:
+        offset = [point[0] - start[0], point[1] - start[1]]
+        distance = abs(segment[0] * offset[1] - segment[1] * offset[0]) / length
+        if distance > tolerance:
+            return False
+    return True
 
 
 def face_from_edge_points(edge_points, edge_kinds):
