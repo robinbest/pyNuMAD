@@ -391,8 +391,12 @@ def _shell_regions(blade, station, section, transformer, cs_params):
         ["HP"] * 6 + ["LP"] * 6,
         hp_segments + lp_segments,
     )
-    stacks, sides, segments = _split_trailing_edge_segments(stacks, sides, segments, station, transformer, cs_params)
-    return _perimeter_shell_regions(stacks, sides, segments, station, section, transformer)
+    stacks, sides, segments, trailing_edge = _trim_trailing_edge_segments(
+        stacks, sides, segments, station, transformer, cs_params
+    )
+    regions = _perimeter_shell_regions(stacks, sides, segments, station, section, transformer)
+    regions.extend(_trailing_edge_adhesive_regions(station, trailing_edge, regions, cs_params))
+    return regions
 
 
 def _clamp_le_surface_protrusion(hp_points, lp_points, te_point, le_point, tolerance=1e-9):
@@ -423,36 +427,7 @@ def _shell_segments(blade, station, section, transformer):
 
     hp_segments = _split_polyline_at_points(section.hp_points, hp_boundaries)
     lp_segments = _split_polyline_at_points(np.flip(section.lp_points, axis=0), lp_boundaries)
-    _close_trailing_edge_segments(hp_segments, lp_segments, section.te_point)
     return hp_segments, lp_segments
-
-
-def _close_trailing_edge_segments(hp_segments, lp_segments, te_point):
-    hp_index = _first_nonzero_segment_index(hp_segments)
-    lp_index = _last_nonzero_segment_index(lp_segments)
-    if hp_index is None or lp_index is None:
-        return
-
-    if hp_index is not None:
-        hp_segments[hp_index] = hp_segments[hp_index].copy()
-        hp_segments[hp_index][0] = te_point
-    if lp_index is not None:
-        lp_segments[lp_index] = lp_segments[lp_index].copy()
-        lp_segments[lp_index][-1] = te_point
-
-
-def _first_nonzero_segment_index(segments):
-    for i_segment, segment in enumerate(segments):
-        if _polyline_lengths(segment)[-1] > 1e-9:
-            return i_segment
-    return None
-
-
-def _last_nonzero_segment_index(segments):
-    for i_segment in reversed(range(len(segments))):
-        if _polyline_lengths(segments[i_segment])[-1] > 1e-9:
-            return i_segment
-    return None
 
 
 def _remove_zero_length_shell_segments(stacks, sides, segments):
@@ -467,31 +442,192 @@ def _remove_zero_length_shell_segments(stacks, sides, segments):
     return list(filtered_stacks), list(filtered_sides), list(filtered_segments)
 
 
-def _split_trailing_edge_segments(stacks, sides, segments, station, transformer, cs_params):
+def _trim_trailing_edge_segments(stacks, sides, segments, station, transformer, cs_params):
     if len(segments) < 2:
-        return stacks, sides, segments
+        return stacks, sides, segments, None
 
-    first_length = _polyline_lengths(segments[0])[-1]
-    last_length = _polyline_lengths(segments[-1])[-1]
-    if first_length <= 1e-9 or last_length <= 1e-9:
-        return stacks, sides, segments
+    hp_count = 0
+    while hp_count < len(sides) and sides[hp_count] == "HP":
+        hp_count += 1
+    lp_start = len(sides)
+    while lp_start > 0 and sides[lp_start - 1] == "LP":
+        lp_start -= 1
+    if hp_count == 0 or lp_start == len(sides):
+        return stacks, sides, segments, None
 
     requested_width = _station_value(cs_params.get("te_adhesive_width"), station, default=0.0)
-    split_width = transformer.length_from_m(requested_width) if requested_width > 0 else 0.45 * min(first_length, last_length)
-    split_width = min(split_width, 0.45 * first_length, 0.45 * last_length)
+    split_width = (
+        transformer.length_from_m(requested_width)
+        if requested_width > 0
+        else _trailing_edge_split_width(
+            stacks[:hp_count],
+            segments[:hp_count],
+            stacks[lp_start:],
+            segments[lp_start:],
+            transformer,
+            cs_params,
+            station,
+        )
+    )
     if split_width <= 1e-9:
-        return stacks, sides, segments
+        return stacks, sides, segments, None
 
-    first_te = _polyline_between(segments[0], 0.0, split_width)
-    first_rest = _polyline_between(segments[0], split_width, first_length)
-    last_rest = _polyline_between(segments[-1], 0.0, last_length - split_width)
-    last_te = _polyline_between(segments[-1], last_length - split_width, last_length)
+    hp_stacks, hp_sides, hp_segments, hp_outer = _trim_segments_from_start(
+        stacks[:hp_count], sides[:hp_count], segments[:hp_count], split_width
+    )
+    lp_stacks, lp_sides, lp_segments, lp_outer = _trim_segments_from_end(
+        stacks[lp_start:], sides[lp_start:], segments[lp_start:], split_width
+    )
+    middle_stacks = stacks[hp_count:lp_start]
+    middle_sides = sides[hp_count:lp_start]
+    middle_segments = segments[hp_count:lp_start]
+
+    if hp_outer is None or lp_outer is None:
+        return stacks, sides, segments, None
+
+    trailing_edge = {
+        "hp_outer": hp_outer,
+        "lp_outer": lp_outer,
+    }
 
     return (
-        [stacks[0], stacks[0]] + stacks[1:-1] + [stacks[-1], stacks[-1]],
-        [sides[0], sides[0]] + sides[1:-1] + [sides[-1], sides[-1]],
-        [first_te, first_rest] + segments[1:-1] + [last_rest, last_te],
+        hp_stacks + middle_stacks + lp_stacks,
+        hp_sides + middle_sides + lp_sides,
+        hp_segments + middle_segments + lp_segments,
+        trailing_edge,
     )
+
+
+def _trailing_edge_split_width(hp_stacks, hp_segments, lp_stacks, lp_segments, transformer, cs_params, station):
+    hp_lengths = [_polyline_lengths(segment)[-1] for segment in hp_segments]
+    lp_lengths = [_polyline_lengths(segment)[-1] for segment in lp_segments]
+    hp_total = sum(hp_lengths)
+    lp_total = sum(lp_lengths)
+    max_width = 0.9 * min(hp_total, lp_total)
+    if max_width <= 1e-9:
+        return 0.0
+
+    def gap_at(width):
+        hp_point = _point_at_path_distance(hp_segments, width)
+        lp_point = _point_at_reversed_path_distance(lp_segments, width)
+        return np.linalg.norm(hp_point - lp_point)
+
+    initial_gap = gap_at(0.0)
+    target_gap = _trailing_edge_target_gap(
+        hp_stacks[0],
+        lp_stacks[-1],
+        transformer,
+        cs_params,
+        station,
+        initial_gap,
+    )
+    local_width = min(hp_lengths[0], lp_lengths[-1])
+    min_width = min(0.02 * local_width, max_width)
+
+    if gap_at(0.0) >= target_gap:
+        return min_width
+    if gap_at(max_width) <= target_gap:
+        return max_width
+
+    low = 0.0
+    high = max_width
+    for _ in range(32):
+        mid = 0.5 * (low + high)
+        if gap_at(mid) < target_gap:
+            low = mid
+        else:
+            high = mid
+    return max(high, min_width)
+
+
+def _trim_segments_from_start(stacks, sides, segments, distance):
+    remaining = distance
+    kept_stacks = []
+    kept_sides = []
+    kept_segments = []
+    removed_parts = []
+    trimming = True
+    for stack, side, segment in zip(stacks, sides, segments):
+        if not trimming:
+            kept_stacks.append(stack)
+            kept_sides.append(side)
+            kept_segments.append(segment)
+            continue
+
+        length = _polyline_lengths(segment)[-1]
+        if remaining >= length - 1e-9:
+            removed_parts.append(segment)
+            remaining -= length
+            continue
+
+        removed_parts.append(_polyline_between(segment, 0.0, remaining))
+        rest = _polyline_between(segment, remaining, length)
+        kept_stacks.append(stack)
+        kept_sides.append(side)
+        kept_segments.append(rest)
+        trimming = False
+
+    return kept_stacks, kept_sides, kept_segments, _join_connected_edges(removed_parts) if removed_parts else None
+
+
+def _trim_segments_from_end(stacks, sides, segments, distance):
+    remaining = distance
+    kept = [(stack, side, segment) for stack, side, segment in zip(stacks, sides, segments)]
+    removed_parts = []
+    for i_segment in reversed(range(len(kept))):
+        stack, side, segment = kept[i_segment]
+        length = _polyline_lengths(segment)[-1]
+        if remaining >= length - 1e-9:
+            removed_parts.insert(0, segment)
+            kept.pop(i_segment)
+            remaining -= length
+            continue
+
+        removed_parts.insert(0, _polyline_between(segment, length - remaining, length))
+        kept[i_segment] = (stack, side, _polyline_between(segment, 0.0, length - remaining))
+        break
+
+    if kept:
+        kept_stacks, kept_sides, kept_segments = zip(*kept)
+        kept_stacks, kept_sides, kept_segments = list(kept_stacks), list(kept_sides), list(kept_segments)
+    else:
+        kept_stacks, kept_sides, kept_segments = [], [], []
+    return kept_stacks, kept_sides, kept_segments, _join_connected_edges(removed_parts) if removed_parts else None
+
+
+def _point_at_path_distance(segments, distance):
+    remaining = distance
+    for segment in segments:
+        length = _polyline_lengths(segment)[-1]
+        if remaining <= length:
+            return _point_at_distance(segment, remaining)
+        remaining -= length
+    return segments[-1][-1]
+
+
+def _point_at_reversed_path_distance(segments, distance):
+    remaining = distance
+    for segment in reversed(segments):
+        length = _polyline_lengths(segment)[-1]
+        if remaining <= length:
+            return _point_at_distance(segment, length - remaining)
+        remaining -= length
+    return segments[0][0]
+
+
+def _trailing_edge_target_gap(hp_stack, lp_stack, transformer, cs_params, station, initial_gap):
+    requested_gap = _station_value(cs_params.get("te_adhesive_gap"), station, default=0.0)
+    if requested_gap > 0:
+        return transformer.length_from_m(requested_gap)
+
+    hp_thickness = transformer.length_from_mm(sum(hp_stack.layer_thicknesses()))
+    lp_thickness = transformer.length_from_mm(sum(lp_stack.layer_thicknesses()))
+    combined_thickness = hp_thickness + lp_thickness
+    thickness_gap = 1.35 * combined_thickness
+    opening_limited_gap = min(1.75 * combined_thickness, initial_gap + transformer.length_from_m(0.008 * transformer.chord))
+    chord_gap = transformer.length_from_m(0.01 * transformer.chord)
+    max_gap = transformer.length_from_m(0.06 * transformer.chord)
+    return min(max(thickness_gap, opening_limited_gap, chord_gap), max_gap)
 
 
 def _shell_regions_from_stack(stack, station, side, outer_points, section, transformer):
@@ -633,6 +769,83 @@ def _shell_region_stack_name(stack, sides, stack_name_counts, i_segment):
     if i_segment == 0 or i_segment == len(sides) - 1:
         return name + "_TE"
     return name
+
+
+def _trailing_edge_adhesive_regions(station, trailing_edge, shell_regions, cs_params):
+    if trailing_edge is None:
+        return []
+
+    hp_outer = _clean_polyline(trailing_edge["hp_outer"])
+    lp_outer = _clean_polyline(trailing_edge["lp_outer"])
+    if _polyline_lengths(hp_outer)[-1] <= 1e-9 or _polyline_lengths(lp_outer)[-1] <= 1e-9:
+        return []
+
+    hp_connector = _shell_cut_connector(shell_regions, hp_outer[-1], "start", side="HP")
+    lp_connector = _shell_cut_connector(shell_regions, lp_outer[0], "end", side="LP")
+    if hp_connector is None or lp_connector is None:
+        return []
+
+    if len(hp_connector) < 2 or len(lp_connector) < 2:
+        return []
+
+    edge_points = _trailing_edge_adhesive_edges(hp_outer, hp_connector, lp_outer, lp_connector)
+    if edge_points is None:
+        return []
+
+    return [
+        FreeCADFaceRegion(
+            name=f"Station{station:03d}_TE_adhesive",
+            material_name=cs_params.get("adhesive_mat_name", "Adhesive"),
+            ply_angle=0.0,
+            edge_points=edge_points,
+            edge_kinds=["spline", "line", "line", "line", "spline", "line"],
+        )
+    ]
+
+
+def _trailing_edge_adhesive_edges(hp_outer, hp_connector, lp_outer, lp_connector):
+    max_depth = min(len(hp_connector), len(lp_connector))
+    for depth in reversed(range(2, max_depth + 1)):
+        hp_cut = hp_connector[:depth]
+        lp_cut = lp_connector[:depth]
+        inner_bridge = np.vstack((hp_cut[-1], lp_cut[-1]))
+        if np.linalg.norm(inner_bridge[0] - inner_bridge[-1]) <= 1e-9:
+            continue
+        trailing_edge_cap = np.vstack((lp_outer[-1], hp_outer[0]))
+        edge_points = [hp_outer, hp_cut, inner_bridge, np.flip(lp_cut, axis=0), lp_outer, trailing_edge_cap]
+        if not _edge_boundary_self_intersects(edge_points):
+            return edge_points
+    return None
+
+
+def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, tolerance=1e-8):
+    candidates_by_layer = []
+    for region in shell_regions:
+        if region.outer_points is None or region.inner_points is None:
+            continue
+        if side is not None and f"_{side}_" not in region.name:
+            continue
+        connector = region.start_connector if connector_end == "start" else region.end_connector
+        if connector is None:
+            continue
+        layer = _layer_index_from_name(region.name)
+        candidates_by_layer.append((layer if layer is not None else 0, region))
+
+    if not candidates_by_layer:
+        return None
+
+    candidates_by_layer.sort(key=lambda item: item[0])
+    points = [outer_point]
+    for _, region in candidates_by_layer:
+        region_outer_point = region.outer_points[0] if connector_end == "start" else region.outer_points[-1]
+        if np.linalg.norm(region_outer_point - points[-1]) > tolerance:
+            continue
+        connector = region.start_connector if connector_end == "start" else region.end_connector
+        ordered = np.flip(connector, axis=0) if connector_end == "start" else connector
+        if np.linalg.norm(ordered[0] - points[-1]) > tolerance:
+            ordered = np.flip(ordered, axis=0)
+        points.extend(ordered[1:])
+    return np.array(points)
 
 
 def _combine_connected_segments(segments):

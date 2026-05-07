@@ -21,7 +21,7 @@ def get_cs_params(blade):
 script_path = write_freecad_cross_sections(
     blade,
     "myBlade_Modified",
-    station_list=[0, 10, 20],
+    station_list=[0, 5, 10, 15, 20, 25, 29],
     directory=".",
     move_le_to_origin=True,
     make_faces=True,
