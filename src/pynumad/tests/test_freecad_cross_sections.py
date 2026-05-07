@@ -161,7 +161,7 @@ def test_detailed_web_adhesive_is_one_face_per_side():
     cs_params = _web_adhesive_cs_params(blade)
 
     section = get_detailed_cross_section(blade, 10, cs_params=cs_params, move_le_to_origin=True)
-    adhesive_regions = [region for region in section.regions if "_adhesive" in region.name]
+    adhesive_regions = [region for region in section.regions if "_web" in region.name and "_adhesive" in region.name]
 
     assert len(adhesive_regions) == 4
     assert all("_layer" not in region.name for region in adhesive_regions)
@@ -226,25 +226,51 @@ def test_station_010_le_points_do_not_protrude_past_shared_tip():
             assert np.max(points[:, 0]) <= le_x + 1e-9
 
 
-def test_shell_layers_share_trailing_edge_offsets():
+def test_shell_layers_terminate_at_trailing_edge_adhesive():
     blade = pynumad.Blade("src/pynumad/tests/test_data/blades/blade.yaml")
 
     for station in [10, 20]:
         section = get_detailed_cross_section(blade, station, move_le_to_origin=True)
-        for i_layer in range(4):
-            layer_regions = [
-                region
-                for region in section.regions
-                if region.outer_points is not None and region.name.endswith(f"layer{i_layer:02d}")
-            ]
-            first_layer = layer_regions[0]
-            last_layer = layer_regions[-1]
-            outer_apex = first_layer.outer_points[0]
-            inner_apex = first_layer.inner_points[0]
+        te_adhesive = next(region for region in section.regions if region.name == f"Station{station:03d}_TE_adhesive")
+        shell_layers = [
+            region
+            for region in section.regions
+            if region.outer_points is not None and region.name.endswith("layer00")
+        ]
+        first_layer = shell_layers[0]
+        last_layer = shell_layers[-1]
 
-            np.testing.assert_allclose(outer_apex, last_layer.outer_points[-1])
-            np.testing.assert_allclose(inner_apex, last_layer.inner_points[-1])
-            assert np.linalg.norm(outer_apex - inner_apex) > 1e-9
+        assert not np.allclose(first_layer.outer_points[0], last_layer.outer_points[-1])
+        assert _region_boundary_contains_points(te_adhesive, first_layer.start_connector)
+        assert _region_boundary_contains_points(te_adhesive, last_layer.end_connector)
+        assert te_adhesive.material_name == "Adhesive"
+
+
+def test_modified_blade_station_020_trailing_edge_adhesive_stays_open():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    for station in [10, 15, 20, 29]:
+        section = get_detailed_cross_section(blade, station, move_le_to_origin=True)
+        te_adhesive = next(region for region in section.regions if region.name == f"Station{station:03d}_TE_adhesive")
+        trailing_edge_cap = te_adhesive.edge_points[-1]
+        cut_gap = np.linalg.norm(te_adhesive.edge_points[0][-1] - te_adhesive.edge_points[4][0])
+
+        assert te_adhesive.material_name == "Adhesive"
+        assert len(te_adhesive.edge_points) == 6
+        assert cut_gap > 0.01
+        assert np.linalg.norm(trailing_edge_cap[0] - trailing_edge_cap[-1]) > 1e-6
+        assert not _has_self_intersection(_region_polygon(te_adhesive))
+
+
+def test_modified_blade_station_005_trailing_edge_adhesive_uses_small_gap():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 5, move_le_to_origin=True)
+    te_adhesive = next(region for region in section.regions if region.name == "Station005_TE_adhesive")
+    cut_gap = np.linalg.norm(te_adhesive.edge_points[0][-1] - te_adhesive.edge_points[4][0])
+
+    assert cut_gap < 0.15
+    assert not _has_self_intersection(_region_polygon(te_adhesive))
 
 
 def test_adjacent_shell_regions_use_stair_step_boundaries():
@@ -421,6 +447,13 @@ def _region_has_edge(region, edge):
 
 def _regions_share_edge(first, second):
     return any(_region_has_edge(first, edge) for edge in second.edge_points or [])
+
+
+def _region_boundary_contains_points(region, points):
+    return all(
+        any(np.allclose(point, candidate) for edge in region.edge_points or [] for candidate in edge)
+        for point in points
+    )
 
 
 def _edges_match(first, second):
