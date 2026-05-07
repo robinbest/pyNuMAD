@@ -1,8 +1,25 @@
 """FreeCAD export helpers for pyNuMAD blade cross sections.
 
-This module intentionally covers only the outer 2D cross-section shape.  It is
-not a drop-in replacement for the Cubit meshing workflow in
-``pynumad.analysis.cubit``.
+The public entry points build either a simple airfoil wire or a detailed 2D
+section made from shell laminate faces, shear-web faces, and adhesive faces.
+The detailed path follows this sequence:
+
+* read station-local HP/LP curves and keypoints from the blade object;
+* split the outer perimeter into stack regions;
+* trim the trailing edge so HP and LP laminates terminate before touching;
+* offset each ply layer inward by its material thickness;
+* square layer boundaries where adjacent stacks have different thicknesses;
+* add shear-web laminates and adhesive regions where web stacks exist;
+* convert each region into FreeCAD faces and store material metadata by face.
+
+Geometry is represented as NumPy arrays of 3D points, but all intersection,
+projection, orientation, and offset logic is intentionally 2D in the station
+cross-section plane using x/y coordinates.  The z coordinate is carried through
+unchanged so FreeCAD receives valid 3D points.
+
+This module intentionally covers 2D cross-section construction for FreeCAD and
+HomoGen workflows.  It is not a drop-in replacement for the Cubit meshing
+workflow in ``pynumad.analysis.cubit``.
 """
 
 from dataclasses import dataclass
@@ -31,7 +48,19 @@ class FreeCADCrossSection:
 
 @dataclass
 class FreeCADFaceRegion:
-    """A named cross-section face region for the generated FreeCAD script."""
+    """A named cross-section face region for the generated FreeCAD script.
+
+    A region is described in one of three ways:
+
+    * ``points``: one closed polygonal face boundary;
+    * ``outer_points``/``inner_points`` plus optional end connectors: a strip
+      between two curves, usually one laminate ply region;
+    * ``edge_points``/``edge_kinds``: an explicit ordered boundary with spline
+      and line edges, used for adhesives, webs, and split spar faces.
+
+    ``material_name`` and ``ply_angle`` are passed through to the FreeCAD face
+    metadata so downstream tools can recover material assignments.
+    """
 
     name: str
     material_name: str
@@ -338,6 +367,14 @@ def face_material_metadata(regions):
 
 
 class _StationTransformer:
+    """Convert station geometry and lengths into the requested output units.
+
+    pyNuMAD stores station geometry in meters and laminate thicknesses in
+    millimeters.  The transformer applies the same scaling, optional chord
+    normalization, and optional leading-edge translation to both points and
+    lengths so all later geometric tolerances are compared in output units.
+    """
+
     def __init__(
         self,
         blade,
@@ -347,6 +384,8 @@ class _StationTransformer:
         normalize_chord,
         move_le_to_origin,
     ):
+        """Store station conversion options and cached chord/LE geometry."""
+
         self.blade = blade
         self.station = station
         self.geometry_scaling = geometry_scaling
@@ -361,6 +400,8 @@ class _StationTransformer:
         )
 
     def points(self, points):
+        """Return input points after scaling, chord normalization, and LE shift."""
+
         xyz = np.array(points, dtype=float) * self.geometry_scaling
         if self.normalize_chord:
             xyz = xyz / (self.chord * self.geometry_scaling)
@@ -369,16 +410,28 @@ class _StationTransformer:
         return xyz
 
     def length_from_m(self, length_m):
+        """Convert a length stored in meters to the section output units."""
+
         length = length_m * self.geometry_scaling
         if self.normalize_chord:
             length = length / (self.chord * self.geometry_scaling)
         return length
 
     def length_from_mm(self, length_mm):
+        """Convert a laminate thickness stored in millimeters to output units."""
+
         return self.length_from_m(0.001 * length_mm)
 
 
 def _shell_regions(blade, station, section, transformer, cs_params):
+    """Build all perimeter shell and trailing-edge adhesive regions.
+
+    The outer airfoil is split by keypoints into six HP and six LP stack
+    segments.  Zero-length segments are discarded, TE segments are shortened to
+    leave an adhesive gap, and remaining segments are expanded into one face per
+    ply layer.
+    """
+
     stackdb = blade.stackdb
     if stackdb.stacks is None:
         return []
@@ -400,6 +453,15 @@ def _shell_regions(blade, station, section, transformer, cs_params):
 
 
 def _clamp_le_surface_protrusion(hp_points, lp_points, te_point, le_point, tolerance=1e-9):
+    """Clamp HP/LP points that numerically protrude past the leading edge.
+
+    Some input station coordinates place the last HP/LP points a tiny distance
+    beyond the nominal LE in x.  That can make the LE face self-intersect after
+    offsetting.  Points beyond the LE are pulled back to the LE x-coordinate,
+    and the final HP/LP points are forced to the exact LE point.  ``1e-9`` is a
+    geometric noise tolerance in output units.
+    """
+
     if abs(le_point[0] - te_point[0]) <= tolerance:
         return
 
@@ -411,6 +473,8 @@ def _clamp_le_surface_protrusion(hp_points, lp_points, te_point, le_point, toler
 
 
 def _clamp_trailing_points_to_le_x(points, le_x, le_is_x_maximum, tolerance):
+    """Clamp the trailing run of points to the leading-edge x limit."""
+
     for i_point in reversed(range(len(points))):
         excess = points[i_point, 0] - le_x if le_is_x_maximum else le_x - points[i_point, 0]
         if excess <= tolerance:
@@ -421,6 +485,13 @@ def _clamp_trailing_points_to_le_x(points, le_x, le_is_x_maximum, tolerance):
 
 
 def _shell_segments(blade, station, section, transformer):
+    """Split HP and LP airfoil curves into stack segments using keypoints.
+
+    HP segments are ordered from trailing edge to leading edge.  LP segments are
+    ordered from leading edge to trailing edge so the combined shell path walks
+    continuously around the perimeter.
+    """
+
     keypoints = transformer.points(blade.keypoints.key_points[:, :, station])
     hp_boundaries = np.vstack((section.hp_points[0], keypoints[0:5], section.hp_points[-1]))
     lp_boundaries = np.vstack((section.lp_points[-1], keypoints[5:10], section.lp_points[0]))
@@ -431,6 +502,12 @@ def _shell_segments(blade, station, section, transformer):
 
 
 def _remove_zero_length_shell_segments(stacks, sides, segments):
+    """Drop stack segments whose curve length is effectively zero.
+
+    A ``1e-9`` length tolerance prevents degenerate faces when keypoints collapse
+    together at small or highly tapered stations.
+    """
+
     filtered = [
         (stack, side, _clean_polyline(segment))
         for stack, side, segment in zip(stacks, sides, segments)
@@ -443,6 +520,16 @@ def _remove_zero_length_shell_segments(stacks, sides, segments):
 
 
 def _trim_trailing_edge_segments(stacks, sides, segments, station, transformer, cs_params):
+    """Trim HP/LP shell paths at the TE and return the removed adhesive edges.
+
+    The detailed model intentionally does not let HP and LP laminates meet
+    directly at the trailing edge.  This function removes equal path distance
+    from the HP start and LP end, possibly across more than one stack segment,
+    so a separate TE adhesive face can close the section.  If the split width is
+    too small, or either side cannot be trimmed, the input segments are returned
+    unchanged and no TE adhesive is generated.
+    """
+
     if len(segments) < 2:
         return stacks, sides, segments, None
 
@@ -499,6 +586,15 @@ def _trim_trailing_edge_segments(stacks, sides, segments, station, transformer, 
 
 
 def _trailing_edge_split_width(hp_stacks, hp_segments, lp_stacks, lp_segments, transformer, cs_params, station):
+    """Find the path distance to remove from each TE side.
+
+    If ``cs_params["te_adhesive_width"]`` is not supplied, the split width is
+    chosen by solving for a target HP/LP gap.  A bisection search over path
+    distance is robust for curved and tapered stations.  The upper bound is
+    ``90%`` of the shorter available TE path so trimming cannot consume an
+    entire side.
+    """
+
     hp_lengths = [_polyline_lengths(segment)[-1] for segment in hp_segments]
     lp_lengths = [_polyline_lengths(segment)[-1] for segment in lp_segments]
     hp_total = sum(hp_lengths)
@@ -541,6 +637,13 @@ def _trailing_edge_split_width(hp_stacks, hp_segments, lp_stacks, lp_segments, t
 
 
 def _trim_segments_from_start(stacks, sides, segments, distance):
+    """Remove ``distance`` along the beginning of a segmented path.
+
+    Returns kept stacks/sides/segments plus the removed edge path.  Whole
+    segments are removed when necessary; the first partially kept segment is
+    split by arc length.
+    """
+
     remaining = distance
     kept_stacks = []
     kept_sides = []
@@ -571,6 +674,12 @@ def _trim_segments_from_start(stacks, sides, segments, distance):
 
 
 def _trim_segments_from_end(stacks, sides, segments, distance):
+    """Remove ``distance`` along the end of a segmented path.
+
+    This is the mirror of :func:`_trim_segments_from_start`; removed parts are
+    returned in geometric order so they can become one adhesive boundary.
+    """
+
     remaining = distance
     kept = [(stack, side, segment) for stack, side, segment in zip(stacks, sides, segments)]
     removed_parts = []
@@ -596,6 +705,8 @@ def _trim_segments_from_end(stacks, sides, segments, distance):
 
 
 def _point_at_path_distance(segments, distance):
+    """Return a point at arc length ``distance`` across connected segments."""
+
     remaining = distance
     for segment in segments:
         length = _polyline_lengths(segment)[-1]
@@ -606,6 +717,8 @@ def _point_at_path_distance(segments, distance):
 
 
 def _point_at_reversed_path_distance(segments, distance):
+    """Return a point measured backward from the end of connected segments."""
+
     remaining = distance
     for segment in reversed(segments):
         length = _polyline_lengths(segment)[-1]
@@ -616,6 +729,15 @@ def _point_at_reversed_path_distance(segments, distance):
 
 
 def _trailing_edge_target_gap(hp_stack, lp_stack, transformer, cs_params, station, initial_gap):
+    """Return the desired HP/LP opening at the TE trim location.
+
+    A station-specific ``te_adhesive_gap`` overrides the heuristic.  Otherwise
+    the gap is based on local combined laminate thickness, lightly increased
+    from the initial TE opening, and bounded between chord-relative limits.  The
+    formula favors robustness for meshing by avoiding both overlaps and tiny
+    adhesive edges.
+    """
+
     requested_gap = _station_value(cs_params.get("te_adhesive_gap"), station, default=0.0)
     if requested_gap > 0:
         return transformer.length_from_m(requested_gap)
@@ -631,6 +753,13 @@ def _trailing_edge_target_gap(hp_stack, lp_stack, transformer, cs_params, statio
 
 
 def _shell_regions_from_stack(stack, station, side, outer_points, section, transformer):
+    """Build ply faces for one isolated shell stack segment.
+
+    This simpler path is used when a paired LE treatment cannot be applied.  It
+    repeatedly offsets the current outer curve inward by each plygroup
+    thickness and returns strip regions between successive curves.
+    """
+
     if len(outer_points) < 2 or _polyline_lengths(outer_points)[-1] <= 1e-9:
         return []
 
@@ -673,6 +802,15 @@ def _shell_regions_from_stack(stack, station, side, outer_points, section, trans
 
 
 def _perimeter_shell_regions(stacks, sides, segments, station, section, transformer):
+    """Expand perimeter stack segments into layer-by-layer shell face regions.
+
+    For each ply layer, all current outer segments are combined into one path so
+    offsets remain consistent across stack boundaries.  Segment slices map the
+    combined path back to individual stack regions.  Boundaries are squared when
+    adjacent stacks have different thicknesses so the resulting faces are easier
+    to mesh and do not contain sliver-like diagonal closures.
+    """
+
     current_segments = [_clean_polyline(segment) for segment in segments]
     stack_name_counts = {
         (side, stack.name): sum(1 for other_side, other_stack in zip(sides, stacks) if other_side == side and other_stack.name == stack.name)
@@ -763,6 +901,8 @@ def _perimeter_shell_regions(stacks, sides, segments, station, section, transfor
 
 
 def _shell_region_stack_name(stack, sides, stack_name_counts, i_segment):
+    """Return a stable region stack name, disambiguating repeated TE stacks."""
+
     name = stack.name
     if stack_name_counts[(sides[i_segment], stack.name)] <= 1:
         return name
@@ -772,6 +912,14 @@ def _shell_region_stack_name(stack, sides, stack_name_counts, i_segment):
 
 
 def _trailing_edge_adhesive_regions(station, trailing_edge, shell_regions, cs_params):
+    """Create the adhesive face that closes the trimmed trailing edge.
+
+    The face boundary uses the removed HP/LP outer curves, the laminate cut
+    connectors through all shell layers, and a final outer TE cap.  If the shell
+    cut connectors cannot be recovered, no adhesive is emitted rather than
+    creating an invalid face.
+    """
+
     if trailing_edge is None:
         return []
 
@@ -804,6 +952,14 @@ def _trailing_edge_adhesive_regions(station, trailing_edge, shell_regions, cs_pa
 
 
 def _trailing_edge_adhesive_edges(hp_outer, hp_connector, lp_outer, lp_connector):
+    """Choose a non-self-intersecting ordered boundary for the TE adhesive.
+
+    Connector depth is tried from innermost to outermost.  This lets the
+    adhesive close through as many laminate layers as possible while falling
+    back gracefully if a deeper boundary would cross itself at a difficult
+    station.
+    """
+
     max_depth = min(len(hp_connector), len(lp_connector))
     for depth in reversed(range(2, max_depth + 1)):
         hp_cut = hp_connector[:depth]
@@ -819,6 +975,14 @@ def _trailing_edge_adhesive_edges(hp_outer, hp_connector, lp_outer, lp_connector
 
 
 def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, tolerance=1e-8):
+    """Collect a through-thickness connector at a trimmed shell end.
+
+    Regions are sorted by layer index and chained from the supplied outer point
+    toward the innermost layer.  Points that do not match within ``1e-8`` output
+    units are skipped, which keeps unrelated or numerically disconnected layers
+    out of the adhesive boundary.
+    """
+
     candidates_by_layer = []
     for region in shell_regions:
         if region.outer_points is None or region.inner_points is None:
@@ -849,6 +1013,8 @@ def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, t
 
 
 def _combine_connected_segments(segments):
+    """Concatenate adjacent shell segments and record each segment slice."""
+
     combined = []
     segment_slices = []
     for segment in segments:
@@ -867,6 +1033,8 @@ def _combine_connected_segments(segments):
 
 
 def _offset_curves_by_thickness(points, closed_points, thicknesses):
+    """Create inward offsets of a combined perimeter path for each thickness."""
+
     offset_curves = {0.0: points}
     for thickness in sorted(set(thicknesses)):
         if thickness > 0:
@@ -875,6 +1043,8 @@ def _offset_curves_by_thickness(points, closed_points, thicknesses):
 
 
 def _close_matching_curve_endpoints(offset_curves):
+    """Force matching start/end points on offset curves for closed paths."""
+
     if not _is_closed_polyline(offset_curves[0.0]):
         return
     for thickness, points in offset_curves.items():
@@ -886,10 +1056,19 @@ def _close_matching_curve_endpoints(offset_curves):
 
 
 def _is_closed_polyline(points, tolerance=1e-9):
+    """Return whether a polyline's endpoints are coincident within tolerance."""
+
     return len(points) > 1 and np.linalg.norm(points[0] - points[-1]) <= tolerance
 
 
 def _curve_end_intersection(first_points, first_end, second_points, second_end):
+    """Intersect endpoint tangent lines, with a local midpoint fallback.
+
+    If the tangent lines are parallel or their intersection lies too far from
+    the local endpoints, the midpoint is used.  The ``0.75 * local_length`` bound
+    avoids long miter spikes at sharp or noisy endpoints.
+    """
+
     first_start, first_next = _endpoint_tangent_points(first_points, first_end)
     second_start, second_next = _endpoint_tangent_points(second_points, second_end)
     fallback = 0.5 * (first_start + second_start)
@@ -908,6 +1087,8 @@ def _curve_end_intersection(first_points, first_end, second_points, second_end):
 
 
 def _endpoint_tangent_points(points, end):
+    """Return endpoint and adjacent point used to define an endpoint tangent."""
+
     if end == "start":
         return points[0], points[1]
     if end == "end":
@@ -916,6 +1097,8 @@ def _endpoint_tangent_points(points, end):
 
 
 def _square_stair_step_boundaries(offset_curves, thicknesses, segment_slices, current_segments, closed=False):
+    """Adjust offset endpoints at stack boundaries before regions are sliced."""
+
     for i_segment, (start, end) in enumerate(segment_slices):
         thickness = thicknesses[i_segment]
         if thickness <= 0:
@@ -943,6 +1126,8 @@ def _square_stair_step_boundaries(offset_curves, thicknesses, segment_slices, cu
 
 
 def _square_disconnected_segment_boundaries(offset_curves, segment_slices, current_segments, tolerance=1e-9):
+    """Square offsets at gaps between non-connected neighboring segments."""
+
     for i_segment, (start, end) in enumerate(segment_slices):
         if i_segment > 0 and np.linalg.norm(current_segments[i_segment - 1][-1] - current_segments[i_segment][0]) > tolerance:
             _square_offset_curve_endpoint(offset_curves, current_segments[i_segment], start, "start")
@@ -951,6 +1136,8 @@ def _square_disconnected_segment_boundaries(offset_curves, segment_slices, curre
 
 
 def _square_offset_curve_endpoint(offset_curves, outer_segment, boundary_index, boundary_end):
+    """Place offset endpoints normal to the local outer-segment tangent."""
+
     outer_point = offset_curves[0.0][boundary_index]
     tangent = _segment_end_tangent(outer_segment, boundary_end)
     for thickness, points in offset_curves.items():
@@ -973,6 +1160,14 @@ def _square_stair_step_boundary(
     boundary_end,
     closed=False,
 ):
+    """Square a boundary where this segment is thicker than its neighbor.
+
+    The thinner adjacent offset is first placed on the local normal, then the
+    current thicker offset is placed on the same normal.  This creates a stepped
+    through-thickness boundary instead of a diagonal connector between unequal
+    laminate thicknesses.
+    """
+
     adjacent_index = i_segment - 1 if boundary_end == "start" else i_segment + 1
     if adjacent_index < 0:
         if not closed:
@@ -1009,6 +1204,8 @@ def _square_stair_step_endpoint(
     boundary_end,
     closed=False,
 ):
+    """Apply the squared stair-step endpoint to the sliced inner segment."""
+
     adjacent_index = i_segment - 1 if boundary_end == "start" else i_segment + 1
     if adjacent_index < 0:
         if not closed:
@@ -1038,6 +1235,12 @@ def _square_stair_step_endpoint(
 
 
 def _segment_end_tangent(points, boundary_end):
+    """Return a unit tangent at the requested segment end.
+
+    Degenerate one-point inputs use ``[1, 0, 0]`` so callers still have a stable
+    normal direction rather than dividing by zero.
+    """
+
     if len(points) < 2:
         return np.array([1.0, 0.0, 0.0])
     if boundary_end == "start":
@@ -1055,6 +1258,12 @@ def _stair_step_connectors(
     inner_end=None,
     closed=False,
 ):
+    """Return start/end through-thickness connectors for one shell segment.
+
+    Connectors include an intermediate point when the adjacent stack is thinner,
+    preserving squared layer transitions in the FreeCAD face boundary.
+    """
+
     thickness = thicknesses[i_segment]
     previous_thickness = thicknesses[i_segment - 1] if i_segment > 0 else (thicknesses[-1] if closed else thickness)
     next_thickness = thicknesses[i_segment + 1] if i_segment < len(thicknesses) - 1 else (thicknesses[0] if closed else thickness)
@@ -1078,6 +1287,12 @@ def _stair_step_connectors(
 
 
 def _merge_trailing_edge_region_pairs(regions):
+    """Merge HP/LP shell regions that still share a trailing-edge endpoint.
+
+    This legacy helper is kept for simple TE closure cases.  The current detailed
+    TE path usually trims HP/LP apart and adds an adhesive face instead.
+    """
+
     merged = []
     removed_ids = set()
     shell_regions_by_layer = {}
@@ -1110,6 +1325,8 @@ def _merge_trailing_edge_region_pairs(regions):
 
 
 def _layer_index_from_name(name):
+    """Extract the integer ``layerNN`` suffix from a generated region name."""
+
     marker = "_layer"
     if marker not in name:
         return None
@@ -1120,6 +1337,8 @@ def _layer_index_from_name(name):
 
 
 def _merged_trailing_edge_region(hp_region, lp_region):
+    """Build one explicit boundary from paired HP/LP trailing-edge regions."""
+
     station_prefix = hp_region.name.split("_", 1)[0]
     layer_suffix = hp_region.name.rsplit("_", 1)[-1]
     return FreeCADFaceRegion(
@@ -1139,6 +1358,13 @@ def _merged_trailing_edge_region(hp_region, lp_region):
 
 
 def _leading_edge_shell_regions(hp_stack, lp_stack, station, hp_outer_points, lp_outer_points, section, transformer):
+    """Create paired HP/LP leading-edge shell regions when layer counts match.
+
+    A shared LE offset avoids small overlaps at the nose by offsetting the HP
+    and LP curves together as one combined curve.  If the layer counts differ,
+    the function falls back to independent stack offsets.
+    """
+
     if (
         len(hp_outer_points) < 2
         or len(lp_outer_points) < 2
@@ -1192,6 +1418,14 @@ def _leading_edge_shell_regions(hp_stack, lp_stack, station, hp_outer_points, lp
 
 
 def _web_regions(blade, station, transformer, cs_params, shell_regions):
+    """Build shear-web laminate and adhesive regions for one station.
+
+    Webs attach to the innermost HP/LP spar-cap shell regions.  The web layer
+    widths are centered on prescribed spar-interface locations, optional
+    adhesive thickness offsets the actual web edges inward, and the affected
+    spar inner edges are split so FreeCAD face metadata still maps cleanly.
+    """
+
     stackdb = blade.stackdb
     if stackdb.swstacks is None:
         return []
@@ -1255,6 +1489,8 @@ def _web_regions(blade, station, transformer, cs_params, shell_regions):
 
 
 def _innermost_spar_region(shell_regions, blade, station, side, stack_index):
+    """Return the innermost generated shell layer for a spar-cap stack."""
+
     stackdb = blade.stackdb
     stack_station = min(station, stackdb.stacks.shape[1] - 1)
     stack_name = stackdb.stacks[stack_index, stack_station].name
@@ -1266,6 +1502,14 @@ def _innermost_spar_region(shell_regions, blade, station, side, stack_index):
 
 
 def _spar_web_interfaces(hp_inner_spar, lp_inner_spar, station, transformer, cs_params, i_web, web_stack):
+    """Return HP/LP interface edge intervals for one shear web.
+
+    Layer widths come from web ply thicknesses.  The interface center is inset
+    from the spar end by web thickness plus adhesive width, then limited to
+    ``45%`` of each spar length so very short spar regions cannot be consumed by
+    the web connection.
+    """
+
     layer_widths = [
         transformer.length_from_mm(plygroup.nPlies * plygroup.thickness)
         for plygroup in web_stack.plygroups
@@ -1304,6 +1548,13 @@ def _spar_web_interfaces(hp_inner_spar, lp_inner_spar, station, transformer, cs_
 
 
 def _centered_intervals(length, center, widths):
+    """Place consecutive layer-width intervals around a center distance.
+
+    If the requested total width exceeds the available curve length, widths are
+    uniformly scaled to ``95%`` of the length.  Intervals shorter than ``1e-9``
+    are discarded as degenerate.
+    """
+
     widths = [width for width in widths if width > 0]
     total_width = sum(widths)
     if total_width <= 0 or length <= 1e-9:
@@ -1325,12 +1576,22 @@ def _centered_intervals(length, center, widths):
 
 
 def _web_interface_centerline(hp_edges, lp_edges):
+    """Return an approximate centerline joining HP and LP web interfaces."""
+
     hp_points = np.vstack((hp_edges[0][0], hp_edges[-1][-1]))
     lp_points = np.vstack((lp_edges[0][0], lp_edges[-1][-1]))
     return np.vstack((hp_points.mean(axis=0), lp_points.mean(axis=0)))
 
 
 def _web_connection_edges(interface_edges, opposite_edges, transformer, cs_params, station, i_web):
+    """Separate shell adhesive edges from web laminate edges.
+
+    With zero adhesive thickness, both sets of edges are identical.  With a
+    positive fore/aft adhesive thickness, web edges are offset toward the
+    opposite interface while the original interface remains the adhesive outer
+    boundary.
+    """
+
     adhesive_m = _station_value(
         cs_params.get("web_fore_adhesive_thickness" if i_web == 0 else "web_aft_adhesive_thickness"),
         station,
@@ -1346,6 +1607,8 @@ def _web_connection_edges(interface_edges, opposite_edges, transformer, cs_param
 
 
 def _offset_edge_toward(edge, target, distance):
+    """Offset each point of an edge toward a target point by a fixed distance."""
+
     offset_points = []
     for point in edge:
         direction = _unit(target - point)
@@ -1354,6 +1617,14 @@ def _offset_edge_toward(edge, target, distance):
 
 
 def _split_region_inner_edge_for_interfaces(region, interface_edges):
+    """Replace a spar inner curve with pieces split around web interfaces.
+
+    The shell region originally has one continuous inner spline.  After web
+    insertion, portions covered by web adhesive should be exact interface edges.
+    This function projects interface endpoints to the inner curve, splits the
+    curve by arc length, and rewrites the region as an explicit edge boundary.
+    """
+
     if region is None or not interface_edges:
         return
 
@@ -1405,6 +1676,8 @@ def _split_region_inner_edge_for_interfaces(region, interface_edges):
 
 
 def _web_laminate_regions(station, i_web, hp_edges, lp_edges, web_stack):
+    """Create one web laminate face per nonzero web plygroup."""
+
     regions = []
     i_valid_layer = 0
     for i_layer, plygroup in enumerate(web_stack.plygroups):
@@ -1428,6 +1701,8 @@ def _web_laminate_regions(station, i_web, hp_edges, lp_edges, web_stack):
 
 
 def _web_adhesive_regions_from_edges(station, i_web, hp_outer_edges, hp_inner_edges, lp_outer_edges, lp_inner_edges, cs_params):
+    """Create HP/LP web adhesive regions when adhesive thickness is nonzero."""
+
     regions = []
     adhesive_name = cs_params.get("adhesive_mat_name", "Adhesive")
     for side, outer_edges, inner_edges in (
@@ -1452,6 +1727,13 @@ def _web_adhesive_regions_from_edges(station, i_web, hp_outer_edges, hp_inner_ed
 
 
 def _web_adhesive_face_edges(outer_edges, inner_edges):
+    """Return the lower-gap, non-crossing boundary for a web adhesive face.
+
+    Two plausible orientations are tested because HP/LP edge order can flip
+    depending on station geometry.  The chosen orientation minimizes closure gap
+    and penalizes self-intersection.
+    """
+
     outer_edges, inner_edges = _connected_edge_order(outer_edges, inner_edges)
     outer_edge = _join_connected_edges(outer_edges)
 
@@ -1491,6 +1773,8 @@ def _web_adhesive_face_edges(outer_edges, inner_edges):
 
 
 def _join_connected_edges(edges):
+    """Join ordered edge point arrays into one polyline without duplicates."""
+
     points = []
     for edge in edges:
         if not points:
@@ -1501,6 +1785,8 @@ def _join_connected_edges(edges):
 
 
 def _connected_edge_order(outer_edges, inner_edges):
+    """Choose the edge ordering/orientation with the smallest path gaps."""
+
     candidates = [
         (outer_edges, inner_edges),
         ([np.flip(edge, axis=0) for edge in outer_edges], [np.flip(edge, axis=0) for edge in inner_edges]),
@@ -1520,6 +1806,8 @@ def _connected_edge_order(outer_edges, inner_edges):
 
 
 def _web_face_edges(first_edge, second_edge):
+    """Return a four-edge web face boundary, avoiding crossed connectors."""
+
     forward = [
         first_edge,
         np.vstack((first_edge[-1], second_edge[-1])),
@@ -1540,6 +1828,8 @@ def _web_face_edges(first_edge, second_edge):
 
 
 def _edge_boundary_gap(edge_points):
+    """Return the largest endpoint gap between consecutive boundary edges."""
+
     if not edge_points:
         return 0.0
     return max(
@@ -1549,6 +1839,8 @@ def _edge_boundary_gap(edge_points):
 
 
 def _edge_boundary_self_intersects(edge_points):
+    """Return whether an ordered edge boundary crosses itself in 2D."""
+
     points = []
     for edge in edge_points:
         if not points:
@@ -1570,6 +1862,8 @@ def _edge_boundary_self_intersects(edge_points):
 
 
 def _segments_intersect_2d(first_start, first_end, second_start, second_end):
+    """Return true when two non-adjacent 2D segments properly intersect."""
+
     first_orientation = _orientation_2d(first_start, first_end, second_start)
     second_orientation = _orientation_2d(first_start, first_end, second_end)
     third_orientation = _orientation_2d(second_start, second_end, first_start)
@@ -1578,10 +1872,19 @@ def _segments_intersect_2d(first_start, first_end, second_start, second_end):
 
 
 def _orientation_2d(start, end, point):
+    """Return the signed 2D cross product for point orientation."""
+
     return np.cross(end[:2] - start[:2], point[:2] - start[:2])
 
 
 def _split_polyline_at_points(points, boundary_points):
+    """Split a polyline at projected boundary points.
+
+    Boundary points are first projected to arc-length locations on ``points``.
+    This avoids depending on exact coordinate equality between keypoints and
+    sampled airfoil coordinates.
+    """
+
     distances = [_project_point_to_polyline(points, point) for point in boundary_points]
     distances[0] = 0.0
     distances[-1] = _polyline_lengths(points)[-1]
@@ -1594,6 +1897,8 @@ def _split_polyline_at_points(points, boundary_points):
 
 
 def _polyline_lengths(points):
+    """Return cumulative arc lengths for a polyline."""
+
     distances = [0.0]
     for start, end in zip(points[:-1], points[1:]):
         distances.append(distances[-1] + np.linalg.norm(end - start))
@@ -1601,6 +1906,13 @@ def _polyline_lengths(points):
 
 
 def _clean_polyline(points, min_distance=1e-3):
+    """Remove near-duplicate interior polyline points.
+
+    The default ``1e-3`` output-unit spacing is deliberately larger than pure
+    floating-point tolerance; it suppresses very short edges that can create tiny
+    mesh elements while preserving endpoints exactly.
+    """
+
     if len(points) <= 2:
         return points
 
@@ -1618,6 +1930,8 @@ def _clean_polyline(points, min_distance=1e-3):
 
 
 def _clean_polygon_points(points, min_distance=1e-9):
+    """Remove duplicate polygon points and an optional duplicate closing point."""
+
     if len(points) <= 2:
         return points
 
@@ -1633,12 +1947,16 @@ def _clean_polygon_points(points, min_distance=1e-9):
 
 
 def _valid_face_boundary(outer_points, inner_points, tolerance=1e-9):
+    """Return whether two strip curves can form a non-degenerate face."""
+
     if len(outer_points) < 2 or len(inner_points) < 2:
         return False
     return _polyline_lengths(outer_points)[-1] > tolerance and _polyline_lengths(inner_points)[-1] > tolerance
 
 
 def _project_point_to_polyline(points, point):
+    """Project a point to the closest arc-length location on a polyline."""
+
     cumulative = _polyline_lengths(points)
     best_distance = float("inf")
     best_s = 0.0
@@ -1657,6 +1975,8 @@ def _project_point_to_polyline(points, point):
 
 
 def _point_at_distance(points, distance):
+    """Interpolate a point at a clipped arc-length distance on a polyline."""
+
     cumulative = _polyline_lengths(points)
     distance = float(np.clip(distance, 0.0, cumulative[-1]))
     index = np.searchsorted(cumulative, distance, side="right") - 1
@@ -1671,6 +1991,8 @@ def _point_at_distance(points, distance):
 
 
 def _polyline_between(points, start_distance, end_distance):
+    """Return the polyline sub-curve between two arc-length distances."""
+
     cumulative = _polyline_lengths(points)
     selected = [_point_at_distance(points, start_distance)]
     for i, distance in enumerate(cumulative[1:-1], start=1):
@@ -1681,6 +2003,14 @@ def _polyline_between(points, start_distance, end_distance):
 
 
 def _offset_open_polyline_inward(points, closed_points, distance, miter_limit=4.0):
+    """Offset an open polyline inward relative to the closed airfoil boundary.
+
+    Segment normals are chosen from the orientation of ``closed_points``.  At
+    interior vertices, adjacent offset lines are intersected to form a miter. If
+    lines are parallel or the miter exceeds ``miter_limit * distance`` (default
+    ``4.0``), an averaged-normal fallback prevents long spikes.
+    """
+
     orientation = _polygon_orientation(closed_points)
     distances = np.full((len(points),), distance) if np.isscalar(distance) else np.array(distance)
     tangents = []
@@ -1712,6 +2042,8 @@ def _offset_open_polyline_inward(points, closed_points, distance, miter_limit=4.
 
 
 def _line_intersection_2d(first_start, first_end, second_start, second_end, tolerance=1e-12):
+    """Return the 2D line intersection, or ``None`` for near-parallel lines."""
+
     first_direction = first_end[:2] - first_start[:2]
     second_direction = second_end[:2] - second_start[:2]
     matrix = np.column_stack((first_direction, -second_direction))
@@ -1725,6 +2057,8 @@ def _line_intersection_2d(first_start, first_end, second_start, second_end, tole
 
 
 def _polygon_orientation(points):
+    """Return ``1`` for counterclockwise or ``-1`` for clockwise point order."""
+
     xy = np.asarray(points)[:, :2]
     x = xy[:, 0]
     y = xy[:, 1]
@@ -1732,6 +2066,8 @@ def _polygon_orientation(points):
 
 
 def _rectangle_about_line(start, end, width):
+    """Return four points for a rectangle centered on a line segment."""
+
     tangent = _unit(end - start)
     normal = _perp(tangent)
     half_width = 0.5 * width
@@ -1739,10 +2075,14 @@ def _rectangle_about_line(start, end, width):
 
 
 def _perp(vector):
+    """Return the in-plane left normal of a vector."""
+
     return np.array([-vector[1], vector[0], 0.0])
 
 
 def _unit(vector):
+    """Return a unit vector, using x-direction for zero-length input."""
+
     norm = np.linalg.norm(vector)
     if norm == 0:
         return np.array([1.0, 0.0, 0.0])
@@ -1750,6 +2090,8 @@ def _unit(vector):
 
 
 def _station_value(values, station, default=0.0):
+    """Return a scalar parameter or the station-specific value from a sequence."""
+
     if values is None:
         return default
     try:
@@ -1759,6 +2101,8 @@ def _station_value(values, station, default=0.0):
 
 
 def _require_freecad_modules():
+    """Import FreeCAD modules or raise a targeted setup error."""
+
     try:
         import FreeCAD as App
         import Part
@@ -1772,10 +2116,14 @@ def _require_freecad_modules():
 
 
 def _freecad_vector(point, App):
+    """Convert a NumPy/list point to ``FreeCAD.Vector``."""
+
     return App.Vector(float(point[0]), float(point[1]), float(point[2]))
 
 
 def _freecad_bspline_edge(points, App, Part):
+    """Create a FreeCAD edge from points, using a line for two-point edges."""
+
     if len(points) == 2:
         return Part.LineSegment(_freecad_vector(points[0], App), _freecad_vector(points[1], App)).toShape()
     curve = Part.BSplineCurve()
@@ -1784,6 +2132,8 @@ def _freecad_bspline_edge(points, App, Part):
 
 
 def _freecad_line_edges(points, App, Part):
+    """Create straight FreeCAD edges between consecutive nonduplicate points."""
+
     edges = []
     for start, end in zip(points[:-1], points[1:]):
         if _freecad_vector(start, App).distanceToPoint(_freecad_vector(end, App)) > 1e-9:
@@ -1792,12 +2142,22 @@ def _freecad_line_edges(points, App, Part):
 
 
 def _freecad_face_from_points(points, App, Part):
+    """Create a planar FreeCAD face from an ordered polygon boundary."""
+
     closed = list(points)
     closed.append(points[0])
     return Part.Face(Part.makePolygon([_freecad_vector(point, App) for point in closed]))
 
 
 def _freecad_face_between_curves(outer_points, inner_points, App, Part, start_connector=None, end_connector=None):
+    """Create a FreeCAD face bounded by outer/inner curves and connectors.
+
+    For straight end connectors, a ruled surface is preferred because FreeCAD's
+    generic wire face filling can occasionally create large spurious rectangular
+    faces for long, thin spline strips.  Non-straight connectors, or ruled
+    surface failures, fall back to a closed wire face.
+    """
+
     outer_edge = _freecad_bspline_edge(outer_points, App, Part)
     if start_connector is None:
         start_connector = [inner_points[0], outer_points[0]]
@@ -1822,6 +2182,8 @@ def _freecad_face_between_curves(outer_points, inner_points, App, Part, start_co
 
 
 def _connector_is_straight(points, tolerance=1e-7):
+    """Return whether connector points lie on one 2D line within tolerance."""
+
     points = np.asarray(points, dtype=float)
     if len(points) <= 2:
         return True
@@ -1839,6 +2201,13 @@ def _connector_is_straight(points, tolerance=1e-7):
 
 
 def _freecad_face_from_edge_points(edge_points, edge_kinds, App, Part):
+    """Create a FreeCAD face from an explicit edge list.
+
+    ``edge_kinds`` selects either line edges or spline edges for each point
+    group.  This path is used for adhesives and split boundaries whose topology
+    is more specific than a simple outer/inner strip.
+    """
+
     edges = []
     for points, kind in zip(edge_points, edge_kinds):
         if kind == "line":
@@ -1849,6 +2218,8 @@ def _freecad_face_from_edge_points(edge_points, edge_kinds, App, Part):
 
 
 def _freecad_face_from_region(region, App, Part):
+    """Dispatch a serialized or dataclass region to the right face builder."""
+
     if _region_value(region, "points") is not None:
         return _freecad_face_from_points(_region_value(region, "points"), App, Part)
     if _region_value(region, "edge_points") is not None:
@@ -1869,23 +2240,31 @@ def _freecad_face_from_region(region, App, Part):
 
 
 def _freecad_stitched_section_shape(faces, Part):
+    """Return a sewn FreeCAD compound from individual face shapes."""
+
     shape = Part.makeCompound(faces)
     shape.sewShape()
     return shape
 
 
 def _set_string_property(obj, name, value, group="", description=""):
+    """Set a FreeCAD string property, creating it if needed."""
+
     if name not in getattr(obj, "PropertiesList", []):
         obj.addProperty("App::PropertyString", name, group, description)
     setattr(obj, name, value)
 
 
 def _set_view_color(obj, color):
+    """Assign a view color when running in a FreeCAD GUI-capable context."""
+
     if hasattr(obj, "ViewObject") and obj.ViewObject is not None:
         obj.ViewObject.ShapeColor = color
 
 
 def _color_for_material(material_name):
+    """Return a simple display color based on material name keywords."""
+
     name = material_name.lower()
     if "adhesive" in name:
         return (1.0, 0.84, 0.0, 0.0)
@@ -1903,12 +2282,16 @@ def _color_for_material(material_name):
 
 
 def _region_value(region, key):
+    """Read a field from either a serialized dict or a region dataclass."""
+
     if isinstance(region, dict):
         return region.get(key)
     return getattr(region, key)
 
 
 def _parsed_region_name(name):
+    """Parse generated region names into metadata fields for downstream tools."""
+
     parts = name.split("_")
     parsed = dict(RegionName=name)
     if parts and parts[0].startswith("Station"):
@@ -1939,6 +2322,8 @@ def _parsed_region_name(name):
 
 
 def _serialize_regions(regions):
+    """Convert region dataclasses into JSON-serializable dictionaries."""
+
     serialized = []
     for region in regions or []:
         item = {
@@ -1965,6 +2350,8 @@ def _serialize_regions(regions):
 
 
 def _freecad_script(payload):
+    """Return a self-contained FreeCAD Python script for serialized sections."""
+
     data = json.dumps(payload, indent=2)
     return f"""# Generated by pynumad.analysis.freecad.make_cross_sections
 import json
