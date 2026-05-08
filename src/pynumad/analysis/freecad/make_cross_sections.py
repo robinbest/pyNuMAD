@@ -1876,8 +1876,10 @@ def _web_regions(blade, station, transformer, cs_params, shell_regions):
         if interfaces is None:
             continue
 
+        # Keep HP/LP interval lists in plygroup order.  Reversing the LP list
+        # pairs a thick core interval on one side with a thin skin interval on
+        # the other, creating long triangular-looking web faces.
         hp_edges, lp_edges = interfaces
-        lp_edges = list(reversed(lp_edges))
         hp_adhesive_edges, hp_web_edges = _web_connection_edges(hp_edges, lp_edges, transformer, cs_params, station, i_web)
         lp_adhesive_edges, lp_web_edges = _web_connection_edges(lp_edges, hp_edges, transformer, cs_params, station, i_web)
 
@@ -1952,7 +1954,11 @@ def _spar_web_interfaces(hp_inner_spar, lp_inner_spar, station, transformer, cs_
         lp_center = lp_length - inset
 
     hp_intervals = _centered_intervals(hp_length, hp_center, layer_widths)
-    lp_intervals = _centered_intervals(lp_length, lp_center, layer_widths)
+    # The HP and LP spar curves run in opposite physical directions around the
+    # section.  Build the LP intervals from reversed widths, then restore
+    # plygroup order, so each web layer connects to a same-thickness interval
+    # without crossing the outer web layers.
+    lp_intervals = list(reversed(_centered_intervals(lp_length, lp_center, list(reversed(layer_widths)))))
     if not hp_intervals or not lp_intervals:
         return None
 

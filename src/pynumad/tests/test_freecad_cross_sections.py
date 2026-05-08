@@ -295,6 +295,23 @@ def test_detailed_web_outer_layers_do_not_cross():
             assert not _segments_intersect(first_hp, first_lp, last_hp, last_lp)
 
 
+def test_iea_station_025_web_layers_keep_matching_ply_widths():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+    cs_params = _web_adhesive_cs_params(blade)
+
+    section = get_detailed_cross_section(blade, 25, cs_params=cs_params, move_le_to_origin=True)
+    web_layers = [region for region in section.regions if region.name.startswith("Station025_web1_layer")]
+
+    assert len(web_layers) == 7
+    for layer in web_layers:
+        web_edges = [edge for edge in layer.edge_points if np.linalg.norm(edge[-1, :2] - edge[0, :2]) < 0.1]
+        lengths = sorted(np.linalg.norm(edge[-1, :2] - edge[0, :2]) for edge in web_edges)
+
+        assert len(lengths) == 2
+        assert lengths[1] / lengths[0] < 1.01
+        assert not _has_self_intersection(_region_polygon(layer))
+
+
 def test_hp_le_final_layer_does_not_self_intersect():
     blade = pynumad.Blade("src/pynumad/tests/test_data/blades/blade.yaml")
 
