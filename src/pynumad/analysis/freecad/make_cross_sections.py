@@ -349,7 +349,7 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
         obj_name = name or f"Station{section.station:03d}_section"
         section_obj = doc.addObject("Part::Feature", obj_name)
         section_obj.Shape = _freecad_stitched_section_shape(face_shapes, Part)
-        section_obj.Label = f"Station {section.station:03d} stitched section"
+        section_obj.Label = f"Station {section.station:03d}"
         _set_string_property(
             section_obj,
             "FaceMaterialMap",
@@ -3065,7 +3065,7 @@ for section in DATA["sections"]:
 
         stitched_obj = doc.addObject("Part::Feature", "Station{{:03d}}_section".format(station))
         stitched_obj.Shape = stitched_section_shape(section_faces)
-        stitched_obj.Label = "Station {{:03d}} stitched section".format(station)
+        stitched_obj.Label = "Station {{:03d}}".format(station)
         stitched_obj.addProperty("App::PropertyString", "FaceMaterialMap", "Turbine", "JSON map from face index to material metadata")
         stitched_obj.FaceMaterialMap = json.dumps(face_metadata(section["regions"]))
         stitched_obj.addProperty("App::PropertyString", "LaminateDefinitions", "Turbine", "JSON table of unique laminate ply stacks")
