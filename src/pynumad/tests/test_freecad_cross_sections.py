@@ -385,6 +385,36 @@ def test_modified_blade_station_005_trailing_edge_adhesive_uses_small_gap():
     assert not _has_self_intersection(_region_polygon(te_adhesive))
 
 
+def test_iea_flatback_station_uses_flatback_trailing_edge_adhesive():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    flatback_adhesive = next(region for region in section.regions if region.name == "Station010_flatTEadhesive")
+    flatback_opening = np.linalg.norm(section.hp_points[0] - section.lp_points[0])
+    hp_first_layer = next(
+        region
+        for region in section.regions
+        if region.name.startswith("Station010_HP_01_") and region.name.endswith("layer00")
+    )
+    lp_first_layer = next(
+        region
+        for region in section.regions
+        if region.name.startswith("Station010_LP_10_") and region.name.endswith("layer00")
+    )
+
+    assert flatback_opening > 0.05 * blade.geometry.ichord[10]
+    assert flatback_adhesive.material_name == "Adhesive"
+    assert len(flatback_adhesive.edge_points) == 6
+    adhesive_opening = np.linalg.norm(
+        flatback_adhesive.edge_points[-1][0] - flatback_adhesive.edge_points[-1][-1]
+    )
+    assert np.isclose(adhesive_opening, flatback_opening)
+    assert _region_boundary_contains_points(flatback_adhesive, hp_first_layer.start_connector)
+    assert _region_boundary_contains_points(flatback_adhesive, lp_first_layer.end_connector)
+    assert not any(region.name == "Station010_TE_adhesive" for region in section.regions)
+    assert not _has_self_intersection(_region_polygon(flatback_adhesive))
+
+
 def test_adjacent_shell_regions_use_stair_step_boundaries():
     blade = pynumad.Blade("src/pynumad/tests/test_data/blades/blade.yaml")
 

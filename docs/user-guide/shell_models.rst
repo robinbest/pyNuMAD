@@ -9,3 +9,12 @@ Currently, shell models can be made using ANSYS or Abaqus.  Examples can be foun
 `write_abaqus_shell_model.py` generates an abaqus input file using the in-house mesher, which can be imported and analyzed using Abaqus CAE.
 
 For shell models, the in-house mesher takes an option for whether to include the trailing edge adhesive, meshed with solid elements.  If included, the output gives constraint equations to tie the motion of the adhesive together with the blade.  write_abaqus_shell_model.py demonstrates the access and usage of this.
+
+FreeCAD and HomoGen cross sections
+----------------------------------
+
+The FreeCAD cross-section export builds one stitched 2D object per selected blade station.  In detailed mode, each face carries JSON metadata for ``FaceMaterialMap``, ``LaminateDefinitions``, and ``MaterialDefinitions`` under the FreeCAD ``Turbine`` property group.
+
+Sharp or nearly closed trailing edges are treated as bonded joints: the HP and LP shell laminates are trimmed before they touch, and a ``Station###_TE_adhesive`` face closes the small trailing-edge gap.  Flatback stations are handled differently, following the Cubit workflow.  When the HP/LP trailing-edge opening is large, the outer flatback wall is preserved and a ``Station###_flatTEadhesive`` face is created from that wall to the trimmed HP/LP shell ends.  This prevents a broad flatback from being mistaken for a sharp trailing edge and gives the shell and adhesive regions shared edges at the flatback corners.
+
+By default, a station is treated as flatback when the HP/LP trailing-edge opening is greater than 5 percent of the local chord and the YAML trailing-edge point lies near the midpoint of that opening.  The behavior can be adjusted with ``cs_params``: set ``enable_flatback_te`` to false to use the small-trailing-edge path everywhere, set ``flatback_te_threshold`` in meters to override the 5 percent chord threshold, or set ``flatback_te_adhesive_width`` in meters to control how far the HP/LP shell ends are trimmed from the flatback wall.  ``flatback_te_adhesive_depth`` is accepted as an older alias for that width.

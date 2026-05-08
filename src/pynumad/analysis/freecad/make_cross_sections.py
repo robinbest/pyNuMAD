@@ -6,10 +6,12 @@ The detailed path follows this sequence:
 
 * read station-local HP/LP curves and keypoints from the blade object;
 * split the outer perimeter into stack regions;
-* trim the trailing edge so HP and LP laminates terminate before touching;
+* trim round/small trailing edges so HP and LP laminates terminate before
+  touching, or preserve large flatback trailing edges as supplied;
 * offset each ply layer inward by its material thickness;
 * square layer boundaries where adjacent stacks have different thicknesses;
 * add shear-web laminates and adhesive regions where web stacks exist;
+* add either a round-TE adhesive face or a flatback-TE adhesive face;
 * convert each region into FreeCAD faces and store material metadata by face.
 
 Geometry is represented as NumPy arrays of 3D points, but all intersection,
@@ -41,9 +43,18 @@ class FreeCADCrossSection:
 
     @property
     def closed_points(self):
-        """Return points ordered around the airfoil perimeter."""
+        """Return points ordered around the actual airfoil perimeter.
 
-        return np.vstack((self.te_point, self.hp_points, np.flip(self.lp_points[:-1], axis=0)))
+        The YAML TE point is often the midpoint of the HP/LP trailing-edge
+        endpoints.  For flatback stations it is not an OML vertex; including it
+        would make offset logic see a pointed tail instead of the physical
+        flatback wall, which creates overlaps where flatback adhesive meets the
+        shell.
+        """
+
+        return _clean_polygon_points(
+            np.vstack((self.hp_points, np.flip(self.lp_points[:-1], axis=0)))
+        )
 
 
 @dataclass
@@ -598,9 +609,11 @@ def _shell_regions(blade, station, section, transformer, cs_params):
     """Build all perimeter shell and trailing-edge adhesive regions.
 
     The outer airfoil is split by keypoints into six HP and six LP stack
-    segments.  Zero-length segments are discarded, TE segments are shortened to
-    leave an adhesive gap, and remaining segments are expanded into one face per
-    ply layer.
+    segments.  Zero-length segments are discarded.  Round or very small TE
+    openings are shortened to leave an adhesive gap.  Large flatback openings
+    are kept at their input geometry and get a separate flatback adhesive strip,
+    matching the Cubit workflow's distinction between round and flatback
+    trailing edges.
     """
 
     stackdb = blade.stackdb
@@ -615,12 +628,72 @@ def _shell_regions(blade, station, section, transformer, cs_params):
         ["HP"] * 6 + ["LP"] * 6,
         hp_segments + lp_segments,
     )
-    stacks, sides, segments, trailing_edge = _trim_trailing_edge_segments(
-        stacks, sides, segments, station, transformer, cs_params
-    )
+    flatback_te = _flatback_trailing_edge(section, transformer, cs_params)
+    trailing_edge = None
+    if flatback_te is None:
+        stacks, sides, segments, trailing_edge = _trim_trailing_edge_segments(
+            stacks, sides, segments, station, transformer, cs_params
+        )
+    else:
+        stacks, sides, segments, flatback_te = _trim_flatback_trailing_edge_segments(
+            stacks,
+            sides,
+            segments,
+            station,
+            transformer,
+            cs_params,
+            flatback_te,
+        )
     regions = _perimeter_shell_regions(stacks, sides, segments, station, section, transformer)
-    regions.extend(_trailing_edge_adhesive_regions(station, trailing_edge, regions, cs_params))
+    if flatback_te is None:
+        regions.extend(_trailing_edge_adhesive_regions(station, trailing_edge, regions, cs_params))
+    else:
+        regions.extend(_flatback_te_adhesive_regions(station, flatback_te, regions, cs_params))
     return regions
+
+
+def _flatback_trailing_edge(section, transformer, cs_params):
+    """Return flatback TE endpoints when the station has a broad blunt tail.
+
+    Cubit treats stations past ``last_round_station`` as flatbacks instead of
+    trimming them like sharp trailing edges.  The FreeCAD path does not receive
+    that station classification, so it detects the same geometry locally: HP
+    and LP must start at a broad, nearly vertical TE wall around the nominal TE
+    midpoint.  The default threshold is ``5%`` of chord in output units.  A
+    station-specific ``flatback_te_threshold`` in meters can override it, and
+    ``enable_flatback_te=False`` disables this branch.
+    """
+
+    if not cs_params.get("enable_flatback_te", True):
+        return None
+    if len(section.hp_points) == 0 or len(section.lp_points) == 0:
+        return None
+
+    hp_outer = section.hp_points[0]
+    lp_outer = section.lp_points[0]
+    opening = np.linalg.norm(hp_outer - lp_outer)
+    requested_threshold = _station_value(
+        cs_params.get("flatback_te_threshold"),
+        section.station,
+        default=0.0,
+    )
+    threshold = (
+        transformer.length_from_m(requested_threshold)
+        if requested_threshold > 0
+        else transformer.length_from_m(0.05 * transformer.chord)
+    )
+    if opening <= threshold:
+        return None
+
+    midpoint = 0.5 * (hp_outer + lp_outer)
+    if np.linalg.norm(section.te_point - midpoint) > 0.15 * opening:
+        return None
+
+    return {
+        "hp_outer": hp_outer,
+        "lp_outer": lp_outer,
+        "opening": opening,
+    }
 
 
 def _clamp_le_surface_protrusion(hp_points, lp_points, te_point, le_point, tolerance=1e-9):
@@ -754,6 +827,106 @@ def _trim_trailing_edge_segments(stacks, sides, segments, station, transformer, 
         hp_segments + middle_segments + lp_segments,
         trailing_edge,
     )
+
+
+def _trim_flatback_trailing_edge_segments(
+    stacks,
+    sides,
+    segments,
+    station,
+    transformer,
+    cs_params,
+    flatback_te,
+):
+    """Trim shell ends near a flatback wall and retain removed adhesive edges.
+
+    The flatback wall itself remains in the adhesive face.  The HP and LP shell
+    ends are moved a short distance away from that wall so the adhesive can
+    share the shell cut connectors instead of overlapping the first shell
+    elements at the flatback corners.
+    """
+
+    if len(segments) < 2:
+        return stacks, sides, segments, flatback_te
+
+    hp_count = 0
+    while hp_count < len(sides) and sides[hp_count] == "HP":
+        hp_count += 1
+    lp_start = len(sides)
+    while lp_start > 0 and sides[lp_start - 1] == "LP":
+        lp_start -= 1
+    if hp_count == 0 or lp_start == len(sides):
+        return stacks, sides, segments, flatback_te
+
+    trim_width = _flatback_trailing_edge_trim_width(
+        stacks[:hp_count],
+        segments[:hp_count],
+        stacks[lp_start:],
+        segments[lp_start:],
+        transformer,
+        cs_params,
+        station,
+    )
+    if trim_width <= 1e-9:
+        return stacks, sides, segments, flatback_te
+
+    hp_stacks, hp_sides, hp_segments, hp_outer = _trim_segments_from_start(
+        stacks[:hp_count], sides[:hp_count], segments[:hp_count], trim_width
+    )
+    lp_stacks, lp_sides, lp_segments, lp_outer = _trim_segments_from_end(
+        stacks[lp_start:], sides[lp_start:], segments[lp_start:], trim_width
+    )
+    if hp_outer is None or lp_outer is None:
+        return stacks, sides, segments, flatback_te
+
+    flatback_te = dict(flatback_te)
+    flatback_te["hp_outer"] = hp_outer
+    flatback_te["lp_outer"] = lp_outer
+
+    middle_stacks = stacks[hp_count:lp_start]
+    middle_sides = sides[hp_count:lp_start]
+    middle_segments = segments[hp_count:lp_start]
+    return (
+        hp_stacks + middle_stacks + lp_stacks,
+        hp_sides + middle_sides + lp_sides,
+        hp_segments + middle_segments + lp_segments,
+        flatback_te,
+    )
+
+
+def _flatback_trailing_edge_trim_width(
+    hp_stacks,
+    hp_segments,
+    lp_stacks,
+    lp_segments,
+    transformer,
+    cs_params,
+    station,
+):
+    """Return shell path distance reserved for flatback adhesive."""
+
+    hp_total = sum(_polyline_lengths(segment)[-1] for segment in hp_segments)
+    lp_total = sum(_polyline_lengths(segment)[-1] for segment in lp_segments)
+    max_width = 0.9 * min(hp_total, lp_total)
+    if max_width <= 1e-9:
+        return 0.0
+
+    requested_width = _station_value(
+        cs_params.get(
+            "flatback_te_adhesive_width",
+            cs_params.get("flatback_te_adhesive_depth"),
+        ),
+        station,
+        default=0.0,
+    )
+    if requested_width > 0:
+        return min(transformer.length_from_m(requested_width), max_width)
+
+    hp_thickness = transformer.length_from_mm(sum(hp_stacks[0].layer_thicknesses()))
+    lp_thickness = transformer.length_from_mm(sum(lp_stacks[-1].layer_thicknesses()))
+    thickness_width = max(hp_thickness, lp_thickness)
+    chord_width = transformer.length_from_m(0.005 * transformer.chord)
+    return min(max(thickness_width, chord_width), max_width)
 
 
 def _trailing_edge_split_width(hp_stacks, hp_segments, lp_stacks, lp_segments, transformer, cs_params, station):
@@ -1152,6 +1325,37 @@ def _trailing_edge_adhesive_edges(hp_outer, hp_connector, lp_outer, lp_connector
         if not _edge_boundary_self_intersects(edge_points):
             return edge_points
     return None
+
+
+def _flatback_te_adhesive_regions(station, flatback_te, shell_regions, cs_params):
+    """Create the adhesive face behind a preserved flatback TE wall.
+
+    For flatback sections the OML already contains a physical trailing-edge
+    wall.  The shell ends are trimmed a short distance away from that wall, and
+    this face fills the transition from the flatback wall to the shell cut
+    connectors.  That gives the adhesive and shell regions shared edges at the
+    HP/LP corners instead of overlapping faces.
+    """
+
+    hp_outer = flatback_te["hp_outer"]
+    lp_outer = flatback_te["lp_outer"]
+    hp_connector = _shell_cut_connector(shell_regions, hp_outer[-1], "start", side="HP")
+    lp_connector = _shell_cut_connector(shell_regions, lp_outer[0], "end", side="LP")
+    if hp_connector is None or lp_connector is None:
+        return []
+    face_edges = _trailing_edge_adhesive_edges(hp_outer, hp_connector, lp_outer, lp_connector)
+    if face_edges is None:
+        return []
+
+    return [
+        FreeCADFaceRegion(
+            name=f"Station{station:03d}_flatTEadhesive",
+            material_name=cs_params.get("adhesive_mat_name", "Adhesive"),
+            ply_angle=0.0,
+            edge_points=face_edges,
+            edge_kinds=["spline", "line", "line", "line", "spline", "line"],
+        )
+    ]
 
 
 def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, tolerance=1e-8):
