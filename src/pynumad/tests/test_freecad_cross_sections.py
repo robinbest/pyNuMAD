@@ -338,6 +338,22 @@ def test_station_010_le_points_do_not_protrude_past_shared_tip():
             assert np.max(points[:, 0]) <= le_x + 1e-9
 
 
+def test_iea_station_002_le_keeps_real_rounded_nose_points():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+
+    section = get_cross_section(blade, 2, move_le_to_origin=True)
+    detailed = get_detailed_cross_section(blade, 2, move_le_to_origin=True)
+    lp_le_panel = next(
+        region
+        for region in detailed.regions
+        if region.name.startswith("Station002_LP_07_") and region.name.endswith("layer00")
+    )
+
+    assert np.max(section.lp_points[:, 0]) > 0.01 * blade.geometry.ichord[2]
+    assert np.max(lp_le_panel.outer_points[:, 0]) > 0.01 * blade.geometry.ichord[2]
+    assert not _has_self_intersection(_region_polygon(lp_le_panel))
+
+
 def test_shell_layers_terminate_at_trailing_edge_adhesive():
     blade = pynumad.Blade("src/pynumad/tests/test_data/blades/blade.yaml")
 

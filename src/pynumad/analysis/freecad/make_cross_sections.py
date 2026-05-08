@@ -696,28 +696,54 @@ def _flatback_trailing_edge(section, transformer, cs_params):
     }
 
 
-def _clamp_le_surface_protrusion(hp_points, lp_points, te_point, le_point, tolerance=1e-9):
+def _clamp_le_surface_protrusion(
+    hp_points,
+    lp_points,
+    te_point,
+    le_point,
+    tolerance=1e-9,
+    max_protrusion_fraction=0.002,
+):
     """Clamp HP/LP points that numerically protrude past the leading edge.
 
     Some input station coordinates place the last HP/LP points a tiny distance
     beyond the nominal LE in x.  That can make the LE face self-intersect after
-    offsetting.  Points beyond the LE are pulled back to the LE x-coordinate,
-    and the final HP/LP points are forced to the exact LE point.  ``1e-9`` is a
-    geometric noise tolerance in output units.
+    offsetting.  Only small protrusions are pulled back to the LE x-coordinate.
+    Larger protrusions are treated as real rounded-nose geometry; clamping them
+    would create an artificial flatfront.  ``1e-9`` is a geometric noise
+    tolerance in output units, and ``0.2%`` of the chord-line length is the
+    default boundary between numerical cleanup and physical geometry.
     """
 
     if abs(le_point[0] - te_point[0]) <= tolerance:
         return
 
     le_is_x_maximum = le_point[0] > te_point[0]
-    _clamp_trailing_points_to_le_x(hp_points, le_point[0], le_is_x_maximum, tolerance)
-    _clamp_trailing_points_to_le_x(lp_points, le_point[0], le_is_x_maximum, tolerance)
+    max_protrusion = max(max_protrusion_fraction * np.linalg.norm(le_point - te_point), tolerance)
+    _clamp_trailing_points_to_le_x(
+        hp_points,
+        le_point[0],
+        le_is_x_maximum,
+        tolerance,
+        max_protrusion,
+    )
+    _clamp_trailing_points_to_le_x(
+        lp_points,
+        le_point[0],
+        le_is_x_maximum,
+        tolerance,
+        max_protrusion,
+    )
     hp_points[-1] = le_point
     lp_points[-1] = le_point
 
 
-def _clamp_trailing_points_to_le_x(points, le_x, le_is_x_maximum, tolerance):
+def _clamp_trailing_points_to_le_x(points, le_x, le_is_x_maximum, tolerance, max_protrusion):
     """Clamp the trailing run of points to the leading-edge x limit."""
+
+    protrusions = points[:, 0] - le_x if le_is_x_maximum else le_x - points[:, 0]
+    if np.max(protrusions) > max_protrusion:
+        return
 
     for i_point in reversed(range(len(points))):
         excess = points[i_point, 0] - le_x if le_is_x_maximum else le_x - points[i_point, 0]
