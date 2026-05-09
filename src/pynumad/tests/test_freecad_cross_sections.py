@@ -250,6 +250,16 @@ def test_detailed_webs_share_edges_with_inner_spar_layers():
             for region in section.regions
             if region.name.startswith(f"Station{station:03d}_LP_08_") and region.name.endswith("layer03")
         )
+        hp_inner_regions = [
+            region
+            for region in section.regions
+            if region.name.startswith(f"Station{station:03d}_HP_") and "_layer" in region.name and region.edge_points is not None
+        ]
+        lp_inner_regions = [
+            region
+            for region in section.regions
+            if region.name.startswith(f"Station{station:03d}_LP_") and "_layer" in region.name and region.edge_points is not None
+        ]
 
         assert hp_inner_spar.edge_points is not None
         assert lp_inner_spar.edge_points is not None
@@ -262,8 +272,8 @@ def test_detailed_webs_share_edges_with_inner_spar_layers():
             assert web_layer.edge_points is not None
             assert hp_adhesive.edge_points is not None
             assert lp_adhesive.edge_points is not None
-            assert _regions_share_edge(hp_inner_spar, hp_adhesive)
-            assert _regions_share_edge(lp_inner_spar, lp_adhesive)
+            assert any(_regions_share_edge(region, hp_adhesive) for region in hp_inner_regions)
+            assert any(_regions_share_edge(region, lp_adhesive) for region in lp_inner_regions)
             assert _regions_share_edge(hp_adhesive, web_layer)
             assert _regions_share_edge(lp_adhesive, web_layer)
 
@@ -293,6 +303,117 @@ def test_detailed_web_outer_layers_do_not_cross():
             last_hp, last_lp = _web_layer_centers(last)
 
             assert not _segments_intersect(first_hp, first_lp, last_hp, last_lp)
+
+
+def test_iea_station_025_web_layers_keep_matching_ply_widths():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+    cs_params = _web_adhesive_cs_params(blade)
+
+    section = get_detailed_cross_section(blade, 25, cs_params=cs_params, move_le_to_origin=True)
+    web_layers = [
+        region
+        for region in section.regions
+        if region.name.startswith("Station025_web") and "_layer" in region.name
+    ]
+
+    assert len(web_layers) == 9
+    for layer in web_layers:
+        web_edges = [edge for edge in layer.edge_points if np.linalg.norm(edge[-1, :2] - edge[0, :2]) < 0.1]
+        lengths = sorted(np.linalg.norm(edge[-1, :2] - edge[0, :2]) for edge in web_edges)
+
+        assert len(lengths) == 2
+        assert lengths[1] / lengths[0] < 1.01
+        assert not _has_self_intersection(_region_polygon(layer))
+
+
+def test_iea_yaml_web_components_use_explicit_web_assignments():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+
+    assert blade.stackdb.swstacks.shape[0] == 3
+    for web_index, web_name in enumerate(["web0", "web1", "web2"]):
+        components = [
+            plygroup.component
+            for plygroup in blade.stackdb.swstacks[web_index, 25].plygroups
+        ]
+
+        assert components == [
+            f"{web_name}_skin00",
+            f"{web_name}_filler",
+            f"{web_name}_skin01",
+        ]
+
+
+def test_iea_station_025_draws_three_distinct_yaml_webs():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+
+    section = get_detailed_cross_section(blade, 25, move_le_to_origin=True)
+    foam_layers = [
+        region
+        for region in section.regions
+        if region.name.startswith("Station025_web") and region.name.endswith("layer01")
+    ]
+    centers = [np.vstack(region.edge_points)[:, :2].mean(axis=0) for region in foam_layers]
+    separations = [
+        np.linalg.norm(first - second)
+        for i, first in enumerate(centers)
+        for second in centers[i + 1 :]
+    ]
+
+    assert len(foam_layers) == 3
+    assert min(separations) > 0.1
+
+
+def test_iea_station_059_active_webs_attach_to_spar_caps():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+    cs_params = _web_adhesive_cs_params(blade)
+
+    for station in [15, 25, 59]:
+        section = get_detailed_cross_section(blade, station, cs_params=cs_params, move_le_to_origin=True)
+        hp_inner_spar = next(
+            region
+            for region in section.regions
+            if region.name.startswith(f"Station{station:03d}_HP_03_") and region.name.endswith("layer03")
+        )
+        lp_inner_spar = next(
+            region
+            for region in section.regions
+            if region.name.startswith(f"Station{station:03d}_LP_08_") and region.name.endswith("layer03")
+        )
+
+        for web_index in [1, 2]:
+            hp_adhesive = next(region for region in section.regions if region.name == f"Station{station:03d}_web{web_index}_hp_adhesive")
+            lp_adhesive = next(region for region in section.regions if region.name == f"Station{station:03d}_web{web_index}_lp_adhesive")
+
+            assert _regions_share_edge(hp_inner_spar, hp_adhesive)
+            assert _regions_share_edge(lp_inner_spar, lp_adhesive)
+
+
+def test_myblade_station_028_webs_do_not_intersect_neighbor_shell_panels():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = _web_adhesive_cs_params(blade)
+
+    section = get_detailed_cross_section(blade, 28, cs_params=cs_params, move_le_to_origin=True)
+    web_regions = [region for region in section.regions if region.name.startswith("Station028_web")]
+    shell_regions = [
+        region
+        for region in section.regions
+        if region.name.startswith("Station028_HP_") or region.name.startswith("Station028_LP_")
+    ]
+
+    assert web_regions
+    for web_region in web_regions:
+        web_polygon = _region_polygon(web_region)
+        for shell_region in shell_regions:
+            assert not _polygons_have_crossing_edges(web_polygon, _region_polygon(shell_region))
+
+
+def test_myblade_station_029_has_no_webs_when_web_stack_has_tapered_out():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = _web_adhesive_cs_params(blade)
+
+    section = get_detailed_cross_section(blade, 29, cs_params=cs_params, move_le_to_origin=True)
+
+    assert not any(region.name.startswith("Station029_web") for region in section.regions)
 
 
 def test_hp_le_final_layer_does_not_self_intersect():
@@ -336,6 +457,22 @@ def test_station_010_le_points_do_not_protrude_past_shared_tip():
             continue
         for points in (region.outer_points, region.inner_points):
             assert np.max(points[:, 0]) <= le_x + 1e-9
+
+
+def test_iea_station_002_le_keeps_real_rounded_nose_points():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+
+    section = get_cross_section(blade, 2, move_le_to_origin=True)
+    detailed = get_detailed_cross_section(blade, 2, move_le_to_origin=True)
+    lp_le_panel = next(
+        region
+        for region in detailed.regions
+        if region.name.startswith("Station002_LP_07_") and region.name.endswith("layer00")
+    )
+
+    assert np.max(section.lp_points[:, 0]) > 0.01 * blade.geometry.ichord[2]
+    assert np.max(lp_le_panel.outer_points[:, 0]) > 0.01 * blade.geometry.ichord[2]
+    assert not _has_self_intersection(_region_polygon(lp_le_panel))
 
 
 def test_shell_layers_terminate_at_trailing_edge_adhesive():
@@ -383,6 +520,36 @@ def test_modified_blade_station_005_trailing_edge_adhesive_uses_small_gap():
 
     assert cut_gap < 0.15
     assert not _has_self_intersection(_region_polygon(te_adhesive))
+
+
+def test_iea_flatback_station_uses_flatback_trailing_edge_adhesive():
+    blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    flatback_adhesive = next(region for region in section.regions if region.name == "Station010_flatTEadhesive")
+    flatback_opening = np.linalg.norm(section.hp_points[0] - section.lp_points[0])
+    hp_first_layer = next(
+        region
+        for region in section.regions
+        if region.name.startswith("Station010_HP_01_") and region.name.endswith("layer00")
+    )
+    lp_first_layer = next(
+        region
+        for region in section.regions
+        if region.name.startswith("Station010_LP_10_") and region.name.endswith("layer00")
+    )
+
+    assert flatback_opening > 0.05 * blade.geometry.ichord[10]
+    assert flatback_adhesive.material_name == "Adhesive"
+    assert len(flatback_adhesive.edge_points) == 6
+    adhesive_opening = np.linalg.norm(
+        flatback_adhesive.edge_points[-1][0] - flatback_adhesive.edge_points[-1][-1]
+    )
+    assert np.isclose(adhesive_opening, flatback_opening)
+    assert _region_boundary_contains_points(flatback_adhesive, hp_first_layer.start_connector)
+    assert _region_boundary_contains_points(flatback_adhesive, lp_first_layer.end_connector)
+    assert not any(region.name == "Station010_TE_adhesive" for region in section.regions)
+    assert not _has_self_intersection(_region_polygon(flatback_adhesive))
 
 
 def test_adjacent_shell_regions_use_stair_step_boundaries():
@@ -602,6 +769,25 @@ def _segments_intersect(first_start, first_end, second_start, second_end):
     third_orientation = _orientation(second_start, second_end, first_start)
     fourth_orientation = _orientation(second_start, second_end, first_end)
     return first_orientation * second_orientation < -1e-12 and third_orientation * fourth_orientation < -1e-12
+
+
+def _polygons_have_crossing_edges(first, second):
+    for first_start, first_end in zip(first[:-1], first[1:]):
+        for second_start, second_end in zip(second[:-1], second[1:]):
+            if _segments_share_endpoint(first_start, first_end, second_start, second_end):
+                continue
+            if _segments_intersect(first_start, first_end, second_start, second_end):
+                return True
+    return False
+
+
+def _segments_share_endpoint(first_start, first_end, second_start, second_end):
+    return (
+        np.linalg.norm(first_start[:2] - second_start[:2]) < 1e-7
+        or np.linalg.norm(first_start[:2] - second_end[:2]) < 1e-7
+        or np.linalg.norm(first_end[:2] - second_start[:2]) < 1e-7
+        or np.linalg.norm(first_end[:2] - second_end[:2]) < 1e-7
+    )
 
 
 def _orientation(start, end, point):

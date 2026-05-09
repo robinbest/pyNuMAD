@@ -425,13 +425,16 @@ def _get_airfoil_normals_angle_change(unit_normals):
     for iVector in range(nPoints - 1):
         currentVector = unit_normals[iVector, :]
         nextVector = unit_normals[iVector + 1, :]
-        idotted = np.dot(currentVector, nextVector)
+        # Roundoff can push the dot product of two unit vectors just outside
+        # [-1, 1], which makes arccos return NaN and can break TE detection for
+        # otherwise valid airfoil inputs.
+        idotted = np.clip(np.dot(currentVector, nextVector), -1.0, 1.0)
         angleChange[iVector] = np.rad2deg(np.arccos(idotted))
 
     # angle change between last point and first point
     currentVector = unit_normals[-1, :]
     nextVector = unit_normals[0, :]
-    dotted = np.dot(currentVector, nextVector)
+    dotted = np.clip(np.dot(currentVector, nextVector), -1.0, 1.0)
     angleChange[-1] = np.rad2deg(np.arccos(dotted))
     return angleChange
 

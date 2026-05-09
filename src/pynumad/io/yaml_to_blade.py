@@ -374,6 +374,76 @@ def _optional_material_value(material, *keys):
     return None
 
 
+def _assign_web_components_from_yaml(component_dict, blade_internal_structure):
+    """Assign WindIO web layers using the explicit ``web`` field.
+
+    Older pyNuMAD readers inferred shear-web membership from component names
+    with substring searches such as ["web", "0"] and ["web", "1"].  That is
+    unsafe for WindIO names like ``web1_skin00`` because the ``skin00`` suffix
+    also contains "0", so skins and fillers can be split across the wrong web.
+    If the YAML provides a layer-level ``web`` field, treat that as the source
+    of truth and attach the matching normalized web arcs to each component.
+    """
+    web_definitions = {
+        web_definition["name"]: web_definition
+        for web_definition in blade_internal_structure.get("webs", [])
+    }
+    web_components = {}
+    for name, component in component_dict.items():
+        if component.web:
+            web_components.setdefault(component.web, []).append(name)
+
+    if not web_components:
+        return False
+
+    missing_webs = sorted(set(web_components) - set(web_definitions))
+    if missing_webs:
+        raise ValueError(
+            "Layer references web definitions that are missing from the YAML: "
+            + ", ".join(missing_webs)
+        )
+
+    fallback_labels = ["b", "c", "d", "e", "a"]
+    group = 1
+    for web_definition in blade_internal_structure.get("webs", []):
+        web_name = web_definition["name"]
+        if web_name not in web_components:
+            continue
+
+        if "start_nd_arc" not in web_definition or "end_nd_arc" not in web_definition:
+            raise ValueError(
+                f'YAML web "{web_name}" is referenced by layer components but '
+                'does not define start_nd_arc and end_nd_arc. FreeCAD/HomoGen '
+                'cross sections need those arcs to place explicit YAML webs.'
+            )
+
+        fallback_label = _legacy_web_extent_label(web_name, group, fallback_labels)
+        start_nd_arc = np.asarray(web_definition["start_nd_arc"]["values"], dtype=float)
+        end_nd_arc = np.asarray(web_definition["end_nd_arc"]["values"], dtype=float)
+        for component_name in web_components[web_name]:
+            component = component_dict[component_name]
+            component.group = group
+            # The real web placement comes from web_start/end_nd_arc below.
+            # Keep a legacy keypoint label here because BOM/segmentation code
+            # still uses hpextents/lpextents to classify shear-web regions.
+            component.hpextents = [fallback_label]
+            component.lpextents = [fallback_label]
+            component.web_start_nd_arc = start_nd_arc
+            component.web_end_nd_arc = end_nd_arc
+        group += 1
+
+    return True
+
+
+def _legacy_web_extent_label(web_name, group, fallback_labels):
+    lowered = web_name.lower()
+    if "fore" in lowered or lowered.endswith("1"):
+        return "b"
+    if "aft" in lowered or "rear" in lowered or lowered.endswith("0"):
+        return "c"
+    return fallback_labels[min(group - 1, len(fallback_labels) - 1)]
+
+
 def _add_components(definition, blade_internal_structure, blade_structure_dict):
     N_layer_comp = len(blade_internal_structure["layers"])
     component_list = list()
@@ -386,6 +456,7 @@ def _add_components(definition, blade_internal_structure, blade_structure_dict):
         # mat_names = [mat.name for mat in definition.materials]
         # C,IA,IB = np.intersect1d(mat_names,i_component_data['material'],return_indices=True)
         cur_comp.materialid = i_component_data["material"]
+        cur_comp.web = i_component_data.get("web")
         try:
             cur_comp.fabricangle = np.mean(
                 i_component_data["fiber_orientation"]["values"]
@@ -520,33 +591,34 @@ def _add_components(definition, blade_internal_structure, blade_structure_dict):
 
     for comp in component_dict:
         logging.debug(comp)
-    key_list = full_keys_from_substrings(component_dict.keys(), ["web", "fore"])  # Try 1
-    if len(key_list) == 0:
-        key_list = full_keys_from_substrings(component_dict.keys(), ["web", "1"])  # Try 2
+    if not _assign_web_components_from_yaml(component_dict, blade_internal_structure):
+        key_list = full_keys_from_substrings(component_dict.keys(), ["web", "fore"])  # Try 1
+        if len(key_list) == 0:
+            key_list = full_keys_from_substrings(component_dict.keys(), ["web", "1"])  # Try 2
 
-    if len(key_list) > 0:
-        for key in key_list:
-            component_dict[key].hpextents = ["b"]
-            component_dict[key].lpextents = ["b"]
-            component_dict[key].group = 1
-    elif len(key_list) == 0:
-        raise ValueError("No fore web layers found found")
+        if len(key_list) > 0:
+            for key in key_list:
+                component_dict[key].hpextents = ["b"]
+                component_dict[key].lpextents = ["b"]
+                component_dict[key].group = 1
+        elif len(key_list) == 0:
+            raise ValueError("No fore web layers found found")
 
-    key_list = full_keys_from_substrings(component_dict.keys(), ["web", "aft"])  # Try 1
-    if len(key_list) == 0:
-        key_list = full_keys_from_substrings(component_dict.keys(), ["web", "0"])  # Try 2
-    if len(key_list) == 0:
-        key_list = full_keys_from_substrings(
-            component_dict.keys(), ["web", "rear"]
-        )  # Try 3
+        key_list = full_keys_from_substrings(component_dict.keys(), ["web", "aft"])  # Try 1
+        if len(key_list) == 0:
+            key_list = full_keys_from_substrings(component_dict.keys(), ["web", "0"])  # Try 2
+        if len(key_list) == 0:
+            key_list = full_keys_from_substrings(
+                component_dict.keys(), ["web", "rear"]
+            )  # Try 3
 
-    if len(key_list) > 0:
-        for key in key_list:
-            component_dict[key].hpextents = ["c"]
-            component_dict[key].lpextents = ["c"]
-            component_dict[key].group = 2
-    elif len(key_list) == 0:
-        raise ValueError("No rear web layers found found")
+        if len(key_list) > 0:
+            for key in key_list:
+                component_dict[key].hpextents = ["c"]
+                component_dict[key].lpextents = ["c"]
+                component_dict[key].group = 2
+        elif len(key_list) == 0:
+            raise ValueError("No rear web layers found found")
 
     ### add components to blade
     definition.components = component_dict
@@ -617,6 +689,13 @@ def _add_spar_caps(definition, blade_structure_dict):
     definition.sparcapwidth_lp = (
         blade_structure_dict[sparCapKeys[lpSideIndex]]["width"]["values"] * 1000
     )
+    if "start_nd_arc" in blade_structure_dict[sparCapKeys[lpSideIndex]]:
+        definition.sparcap_start_nd_arc_lp = blade_structure_dict[
+            sparCapKeys[lpSideIndex]
+        ]["start_nd_arc"]["values"]
+        definition.sparcap_end_nd_arc_lp = blade_structure_dict[
+            sparCapKeys[lpSideIndex]
+        ]["end_nd_arc"]["values"]
     try:
         definition.sparcapoffset_lp = (
             blade_structure_dict[sparCapKeys[lpSideIndex]]["offset_y_pa"]["values"]
@@ -633,6 +712,13 @@ def _add_spar_caps(definition, blade_structure_dict):
     definition.sparcapwidth_hp = (
         blade_structure_dict[sparCapKeys[hpSideIndex]]["width"]["values"] * 1000
     )
+    if "start_nd_arc" in blade_structure_dict[sparCapKeys[hpSideIndex]]:
+        definition.sparcap_start_nd_arc_hp = blade_structure_dict[
+            sparCapKeys[hpSideIndex]
+        ]["start_nd_arc"]["values"]
+        definition.sparcap_end_nd_arc_hp = blade_structure_dict[
+            sparCapKeys[hpSideIndex]
+        ]["end_nd_arc"]["values"]
     try:
         definition.sparcapoffset_hp = (
             blade_structure_dict[sparCapKeys[hpSideIndex]]["offset_y_pa"]["values"]
