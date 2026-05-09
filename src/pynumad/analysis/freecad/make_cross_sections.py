@@ -12,7 +12,9 @@ The detailed path follows this sequence:
 * square layer boundaries where adjacent stacks have different thicknesses;
 * add shear-web laminates and adhesive regions where web stacks exist;
 * add either a round-TE adhesive face or a flatback-TE adhesive face;
-* convert each region into FreeCAD faces and store material metadata by face.
+* convert each region into FreeCAD faces and store material metadata by face;
+* store per-station reference-axis and local-coordinate-system metadata for
+  downstream curved-blade placement.
 
 Geometry is represented as NumPy arrays of 3D points, but all intersection,
 projection, orientation, and offset logic is intentionally 2D in the station
@@ -40,6 +42,7 @@ class FreeCADCrossSection:
     te_point: np.ndarray
     hp_points: np.ndarray
     lp_points: np.ndarray
+    station_frame: dict = None
 
     @property
     def closed_points(self):
@@ -148,7 +151,13 @@ def get_cross_section(
     hp_points = xyz[1:i_le, :]
     lp_points = np.flip(xyz, axis=0)[1:i_le, :]
     _clamp_le_surface_protrusion(hp_points, lp_points, xyz[0, :], xyz[i_le - 1, :])
-    return FreeCADCrossSection(station=station, te_point=xyz[0, :], hp_points=hp_points, lp_points=lp_points)
+    return FreeCADCrossSection(
+        station=station,
+        te_point=xyz[0, :],
+        hp_points=hp_points,
+        lp_points=lp_points,
+        station_frame=station_frame_definition(blade, station),
+    )
 
 
 def get_detailed_cross_section(
@@ -191,6 +200,7 @@ def get_detailed_cross_section(
         te_point=section.te_point,
         hp_points=section.hp_points,
         lp_points=section.lp_points,
+        station_frame=section.station_frame,
         regions=regions,
         material_definitions=material_definitions(blade),
     )
@@ -255,6 +265,7 @@ def write_freecad_cross_sections(
                 "station": section.station,
                 "hp": section.hp_points.tolist(),
                 "lp": section.lp_points.tolist(),
+                "station_frame": section.station_frame,
                 "regions": _serialize_regions(getattr(section, "regions", None)),
             }
             for section in sections
@@ -328,7 +339,9 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
     * ``LaminateDefinitions``: unique laminate ply stacks referenced by
       ``FaceMaterialMap[*]["assignment_name"]``;
     * ``MaterialDefinitions``: project-local material properties referenced by
-      material assignments and laminate ply entries.
+      material assignments and laminate ply entries;
+    * ``StationFrame``: station reference-axis origin, bend/sweep rotations,
+      twist, and local coordinate system.
     """
 
     App, Part = _require_freecad_modules()
@@ -371,6 +384,13 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
             group="Turbine",
             description="JSON table of material properties from pyNuMAD",
         )
+        _set_string_property(
+            section_obj,
+            "StationFrame",
+            json.dumps(getattr(section, "station_frame", None) or {}),
+            group="Turbine",
+            description="JSON station reference-axis origin, rotations, and local coordinate system",
+        )
         _set_view_color(section_obj, (0.78, 0.82, 0.86, 0.0))
         return section_obj
 
@@ -382,6 +402,13 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
     ).toShape()
     wire_obj = doc.addObject("Part::Feature", name or f"Station{section.station:03d}_wire")
     wire_obj.Shape = Part.Wire([hp_edge, lp_edge, te_edge])
+    _set_string_property(
+        wire_obj,
+        "StationFrame",
+        json.dumps(getattr(section, "station_frame", None) or {}),
+        group="Turbine",
+        description="JSON station reference-axis origin, rotations, and local coordinate system",
+    )
     return wire_obj
 
 
@@ -487,6 +514,98 @@ def material_definitions(blade):
 
         definitions.append(item)
     return definitions
+
+
+def station_frame_definition(blade, station):
+    """Return reference-axis orientation data for one blade station.
+
+    WindIO stores the blade generating line in
+    ``outer_shape_bem.reference_axis.x/y/z`` and the section twist in
+    ``outer_shape_bem.twist``.  pyNuMAD imports those as sweep/prebend/span and
+    twist arrays.  This table keeps the physical reference-axis origin and a
+    right-handed local coordinate system so downstream tools can place a 2D
+    cross section in the curved/twisted blade frame.
+
+    The frame data always come from ``outer_shape_bem.reference_axis`` and use
+    a right-handed convention: ``z_axis`` follows the reference-axis tangent,
+    while ``x_axis``/``y_axis`` are twisted about ``z_axis``.  Those constants
+    are documented here instead of repeated in every station's JSON output.
+    """
+
+    geometry = blade.geometry
+    span = np.asarray(blade.definition.ispan, dtype=float)
+    origin = np.array(
+        [
+            -blade.definition.rotorspin * geometry.isweep[station],
+            geometry.iprebend[station],
+            span[station],
+        ],
+        dtype=float,
+    )
+    dx_dz = _station_derivative(span, -blade.definition.rotorspin * geometry.isweep, station)
+    dy_dz = _station_derivative(span, geometry.iprebend, station)
+    twist_deg = float(geometry.idegreestwist[station])
+    basis = _station_lcs_basis(dx_dz, dy_dz, twist_deg, blade.definition.rotorspin)
+
+    return {
+        "station": int(station),
+        "span": _json_value(span[station]),
+        "origin": _json_value(origin),
+        "origin_units": "m",
+        "reference_axis": {
+            "x": _json_value(origin[0]),
+            "y": _json_value(origin[1]),
+            "z": _json_value(origin[2]),
+            "units": "m",
+        },
+        "rotations": {
+            "prebend_angle_deg": _json_value(np.rad2deg(np.arctan2(dy_dz, 1.0))),
+            "sweep_angle_deg": _json_value(np.rad2deg(np.arctan2(dx_dz, 1.0))),
+            "twist_deg": _json_value(twist_deg),
+            "prebend_slope": _json_value(dy_dz),
+            "sweep_slope": _json_value(dx_dz),
+        },
+        "lcs": {
+            "origin": _json_value(origin),
+            "x_axis": _json_value(basis[:, 0]),
+            "y_axis": _json_value(basis[:, 1]),
+            "z_axis": _json_value(basis[:, 2]),
+        },
+    }
+
+
+def _station_derivative(span, values, station):
+    """Return d(values)/d(span) at a station using neighboring stations."""
+
+    values = np.asarray(values, dtype=float)
+    if span.size < 2:
+        return 0.0
+    if station <= 0:
+        denominator = span[1] - span[0]
+        return 0.0 if denominator == 0 else float((values[1] - values[0]) / denominator)
+    if station >= span.size - 1:
+        denominator = span[-1] - span[-2]
+        return 0.0 if denominator == 0 else float((values[-1] - values[-2]) / denominator)
+    denominator = span[station + 1] - span[station - 1]
+    return 0.0 if denominator == 0 else float((values[station + 1] - values[station - 1]) / denominator)
+
+
+def _station_lcs_basis(dx_dz, dy_dz, twist_deg, rotorspin):
+    """Build a right-handed station LCS from reference-axis slope and twist."""
+
+    z_axis = _unit(np.array([dx_dz, dy_dz, 1.0], dtype=float))
+    x_seed = np.array([1.0, 0.0, 0.0])
+    x_axis = x_seed - np.dot(x_seed, z_axis) * z_axis
+    if np.linalg.norm(x_axis) <= 1e-12:
+        x_seed = np.array([0.0, 1.0, 0.0])
+        x_axis = x_seed - np.dot(x_seed, z_axis) * z_axis
+    x_axis = _unit(x_axis)
+    y_axis = _unit(np.cross(z_axis, x_axis))
+
+    twist = np.deg2rad(-rotorspin * twist_deg)
+    x_twisted = np.cos(twist) * x_axis + np.sin(twist) * y_axis
+    y_twisted = -np.sin(twist) * x_axis + np.cos(twist) * y_axis
+    return np.column_stack((_unit(x_twisted), _unit(y_twisted), z_axis))
 
 
 def _elastic_definition(material):
@@ -3227,6 +3346,8 @@ for section in DATA["sections"]:
         stitched_obj.LaminateDefinitions = json.dumps(laminate_definitions(section["regions"]))
         stitched_obj.addProperty("App::PropertyString", "MaterialDefinitions", "Turbine", "JSON table of material properties from pyNuMAD")
         stitched_obj.MaterialDefinitions = json.dumps(DATA["material_definitions"])
+        stitched_obj.addProperty("App::PropertyString", "StationFrame", "Turbine", "JSON station reference-axis origin, rotations, and local coordinate system")
+        stitched_obj.StationFrame = json.dumps(section.get("station_frame", {{}}))
         if hasattr(stitched_obj, "ViewObject") and stitched_obj.ViewObject is not None:
             stitched_obj.ViewObject.ShapeColor = (0.78, 0.82, 0.86, 0.0)
         created.append(stitched_obj)
@@ -3244,6 +3365,8 @@ for section in DATA["sections"]:
 
         wire_obj = doc.addObject("Part::Feature", "Station{{:03d}}_wire".format(station))
         wire_obj.Shape = wire
+        wire_obj.addProperty("App::PropertyString", "StationFrame", "Turbine", "JSON station reference-axis origin, rotations, and local coordinate system")
+        wire_obj.StationFrame = json.dumps(section.get("station_frame", {{}}))
         created.append(wire_obj)
 
         hp_obj = doc.addObject("Part::Feature", "Station{{:03d}}_HP".format(station))

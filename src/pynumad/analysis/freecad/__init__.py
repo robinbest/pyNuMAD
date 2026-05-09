@@ -9,5 +9,6 @@ from .make_cross_sections import (
     material_definitions,
     make_freecad_cross_section_parts,
     make_freecad_section_part,
+    station_frame_definition,
     write_freecad_cross_sections,
 )

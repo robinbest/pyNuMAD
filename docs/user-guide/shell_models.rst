@@ -56,3 +56,21 @@ Some legacy example YAML files contain ``webs`` entries without
 ``start_nd_arc``/``end_nd_arc``.  Those files can still describe materials and
 shell laminates, but they are incomplete for explicit FreeCAD/HomoGen web
 placement and will report a load error identifying the missing web arcs.
+
+Station frames
+~~~~~~~~~~~~~~
+
+Each generated FreeCAD station object also receives a ``StationFrame`` JSON
+property in the ``Turbine`` property group.  The source data are the WindIO
+``outer_shape_bem.reference_axis`` curve and ``outer_shape_bem.twist`` field.
+During YAML import, pyNuMAD stores ``reference_axis.x``/``y``/``z`` as the
+blade generating-line position and ``twist`` as the section twist angle.
+
+``StationFrame`` contains the physical reference-axis origin in meters, the
+local span location, two bend/sweep slopes and angles derived from the
+reference-axis slope, the twist angle, and a right-handed local coordinate
+system.  The local ``z_axis`` follows the reference-axis tangent.  The local
+``x_axis`` and ``y_axis`` are perpendicular to that tangent and are rotated by
+the station twist.  This gives downstream tools such as HomoGen enough
+information to place a 2D cross section in the curved/twisted blade instead of
+treating the blade as straight.

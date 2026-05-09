@@ -9,6 +9,7 @@ from pynumad.analysis.freecad import (
     material_definitions,
     make_freecad_cross_section_parts,
     make_freecad_section_part,
+    station_frame_definition,
     write_freecad_cross_sections,
 )
 
@@ -41,6 +42,8 @@ def test_write_freecad_cross_sections_script(tmp_path):
     assert "import FreeCAD as App" in contents
     assert '"station": 0' in contents
     assert "Station{:03d}_wire" in contents
+    assert '"station_frame"' in contents
+    assert "StationFrame" in contents
 
 
 def test_get_detailed_cross_section_has_shell_and_web_regions():
@@ -57,6 +60,33 @@ def test_get_detailed_cross_section_has_shell_and_web_regions():
     assert any("HP" in region.name for region in section.regions)
     assert any("web" in region.name for region in section.regions)
     assert all(region.points is not None or region.outer_points is not None or region.edge_points is not None for region in section.regions)
+    assert section.station_frame["station"] == 10
+    assert "lcs" in section.station_frame
+
+
+def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    frame = station_frame_definition(blade, 10)
+    basis = np.column_stack(
+        (
+            frame["lcs"]["x_axis"],
+            frame["lcs"]["y_axis"],
+            frame["lcs"]["z_axis"],
+        )
+    )
+
+    assert frame["station"] == 10
+    np.testing.assert_allclose(frame["origin"], [0.0, blade.geometry.iprebend[10], blade.ispan[10]])
+    assert set(frame["rotations"]) == {
+        "prebend_angle_deg",
+        "sweep_angle_deg",
+        "twist_deg",
+        "prebend_slope",
+        "sweep_slope",
+    }
+    assert abs(frame["rotations"]["twist_deg"] - blade.geometry.idegreestwist[10]) < 1e-12
+    np.testing.assert_allclose(basis.T @ basis, np.eye(3), atol=1e-12)
 
 
 def test_freecad_direct_api_is_importable_without_freecad():
