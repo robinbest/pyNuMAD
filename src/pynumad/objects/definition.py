@@ -92,6 +92,10 @@ class Definition:
         # Kept for Excel-reader backward compat (single-value variants)
         self.sparcapoffset: Optional[ndarray] = None
         self.sparcapwidth: Optional[ndarray] = None
+        self.sparcap_start_nd_arc_hp: Optional[ndarray] = None
+        self.sparcap_end_nd_arc_hp: Optional[ndarray] = None
+        self.sparcap_start_nd_arc_lp: Optional[ndarray] = None
+        self.sparcap_end_nd_arc_lp: Optional[ndarray] = None
 
         # Configuration flags with validated setters
         self._natural_offset: int = 1

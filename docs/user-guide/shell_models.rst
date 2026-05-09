@@ -18,3 +18,41 @@ The FreeCAD cross-section export builds one stitched 2D object per selected blad
 Sharp or nearly closed trailing edges are treated as bonded joints: the HP and LP shell laminates are trimmed before they touch, and a ``Station###_TE_adhesive`` face closes the small trailing-edge gap.  Flatback stations are handled differently, following the Cubit workflow.  When the HP/LP trailing-edge opening is large, the outer flatback wall is preserved and a ``Station###_flatTEadhesive`` face is created from that wall to the trimmed HP/LP shell ends.  This prevents a broad flatback from being mistaken for a sharp trailing edge and gives the shell and adhesive regions shared edges at the flatback corners.
 
 By default, a station is treated as flatback when the HP/LP trailing-edge opening is greater than 5 percent of the local chord and the YAML trailing-edge point lies near the midpoint of that opening.  The behavior can be adjusted with ``cs_params``: set ``enable_flatback_te`` to false to use the small-trailing-edge path everywhere, set ``flatback_te_threshold`` in meters to override the 5 percent chord threshold, or set ``flatback_te_adhesive_width`` in meters to control how far the HP/LP shell ends are trimmed from the flatback wall.  ``flatback_te_adhesive_depth`` is accepted as an older alias for that width.
+
+WindIO shear webs and spar caps
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For WindIO YAML files that assign layer components to named webs with the layer
+``web`` field, pyNuMAD treats that field as the source of truth for web
+membership.  This avoids name-substring ambiguity such as ``web1_skin00``
+matching both ``web1`` and ``web0``.  The corresponding entry in
+``internal_structure_2d_fem.webs`` must provide ``start_nd_arc`` and
+``end_nd_arc`` values; otherwise the web layup is known but its section
+location is not.
+
+WindIO normalized perimeter arcs use the opposite direction from pyNuMAD's
+signed station arclength.  During import, web endpoints and spar-cap bounds are
+converted onto the pyNuMAD station arclength convention before keypoints are
+generated.  When spar-cap ``start_nd_arc`` and ``end_nd_arc`` values are
+available, the FreeCAD cross-section export uses them for the thick spar-cap
+face boundaries.  YAML-defined web endpoints are then attached to the shell
+region selected from their outer-surface arc location, with an explicit
+preference for the spar-cap face whenever the endpoint lies inside the spar-cap
+arc interval.  This keeps web adhesives sharing edges with the thick spar-cap
+faces throughout the span, including stations where a web endpoint falls close
+to a neighboring panel boundary.
+
+At stations near the blade tip, web spans and distances between web endpoints
+can become very small.  The detailed FreeCAD export does not reuse the previous
+station's web stack after the web has tapered out of ``StackDB``; this avoids
+creating duplicate or near-coincident webs at the final station.  For active
+webs that lie very close to a shell-stack boundary, the web layer intervals are
+kept a small distance inside the attachment face when there is enough room.
+That clearance prevents a finite-thickness web core from crossing into the
+neighboring shell panel while preserving the shared adhesive edge with the
+intended spar or panel face.
+
+Some legacy example YAML files contain ``webs`` entries without
+``start_nd_arc``/``end_nd_arc``.  Those files can still describe materials and
+shell laminates, but they are incomplete for explicit FreeCAD/HomoGen web
+placement and will report a load error identifying the missing web arcs.

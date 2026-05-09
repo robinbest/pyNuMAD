@@ -27,6 +27,18 @@ KEY_LABELS: list = [
 ]
 
 
+def _windio_nd_arcs_to_pynumad_arcs(start_nd_arc, end_nd_arc, hp_te_arc, lp_te_arc):
+    """Convert WindIO normalized perimeter arcs to pyNuMAD signed arclengths."""
+
+    arc_span = lp_te_arc - hp_te_arc
+    return np.array(
+        (
+            hp_te_arc + (1.0 - start_nd_arc) * arc_span,
+            hp_te_arc + (1.0 - end_nd_arc) * arc_span,
+        )
+    )
+
+
 class KeyPoints:
     """Keypoints class
 
@@ -197,6 +209,15 @@ class KeyPoints:
             a = np.amin((a, 0.01 * geometry.arclength[ns, k]))
             b = np.amin(((z + 0.5 * scwidth_hp), 0.15 * geometry.arclength[ns, k]))
             c = np.amax(((z - 0.5 * scwidth_hp), 0.8 * geometry.arclength[ns, k]))
+            if definition.sparcap_start_nd_arc_hp is not None and definition.sparcap_end_nd_arc_hp is not None:
+                hp_spar_arcs = _windio_nd_arcs_to_pynumad_arcs(
+                    definition.sparcap_start_nd_arc_hp[k],
+                    definition.sparcap_end_nd_arc_hp[k],
+                    geometry.arclength[ns, k],
+                    geometry.arclength[nf, k],
+                )
+                c = np.amin(hp_spar_arcs)
+                b = np.amax(hp_spar_arcs)
             d = np.amin(
                 ((geometry.arclength[0, k] + n2), 0.85 * geometry.arclength[ns, k])
             )
@@ -243,6 +264,15 @@ class KeyPoints:
             a = np.amax((a, 0.01 * geometry.arclength[nf, k]))
             b = np.amax(((z - 0.5 * scwidth_lp), 0.15 * geometry.arclength[nf, k]))
             c = np.amin((z + 0.5 * scwidth_lp, 0.8 * geometry.arclength[nf, k]))
+            if definition.sparcap_start_nd_arc_lp is not None and definition.sparcap_end_nd_arc_lp is not None:
+                lp_spar_arcs = _windio_nd_arcs_to_pynumad_arcs(
+                    definition.sparcap_start_nd_arc_lp[k],
+                    definition.sparcap_end_nd_arc_lp[k],
+                    geometry.arclength[ns, k],
+                    geometry.arclength[nf, k],
+                )
+                b = np.amin(lp_spar_arcs)
+                c = np.amax(lp_spar_arcs)
             d = np.amax(
                 (geometry.arclength[-1, k] - n2, 0.85 * geometry.arclength[nf, k])
             )
@@ -301,6 +331,63 @@ class KeyPoints:
                 for comp in definition.components
                 if definition.components[comp].group == ksw + 1
             ]
+
+            explicit_web_cmpts = [
+                comp
+                for comp in ksw_cmpts
+                if comp.web_start_nd_arc is not None and comp.web_end_nd_arc is not None
+            ]
+            if explicit_web_cmpts:
+                if len(explicit_web_cmpts) != len(ksw_cmpts):
+                    raise ValueError(
+                        f"Component group {ksw} mixes YAML-defined and keypoint-defined shear-web geometry"
+                    )
+
+                start_nd_arc = explicit_web_cmpts[0].web_start_nd_arc
+                end_nd_arc = explicit_web_cmpts[0].web_end_nd_arc
+                for comp in explicit_web_cmpts[1:]:
+                    if not np.allclose(start_nd_arc, comp.web_start_nd_arc) or not np.allclose(
+                        end_nd_arc, comp.web_end_nd_arc
+                    ):
+                        raise ValueError(
+                            f"Component group {ksw} contains inconsistent YAML web arc definitions"
+                        )
+
+                self.web_indices[ksw].extend([np.nan, np.nan])
+                for k in range(num_istations):
+                    # WindIO web arcs follow the opposite perimeter direction
+                    # from pyNuMAD's signed station arclength.  The web
+                    # start_nd_arc lies on the suction/LP side and end_nd_arc
+                    # lies on the pressure/HP side for WindIO blade YAML files.
+                    # Convert with (1 - nd_arc) so these endpoints line up
+                    # with the corresponding spar-cap start/end arcs instead
+                    # of drifting into the neighboring panel regions.
+                    hp_te_arc = geometry.arclength[ns, k]
+                    lp_te_arc = geometry.arclength[nf, k]
+                    hp_arc = _windio_nd_arcs_to_pynumad_arcs(
+                        end_nd_arc[k],
+                        end_nd_arc[k],
+                        hp_te_arc,
+                        lp_te_arc,
+                    )[0]
+                    lp_arc = _windio_nd_arcs_to_pynumad_arcs(
+                        start_nd_arc[k],
+                        start_nd_arc[k],
+                        hp_te_arc,
+                        lp_te_arc,
+                    )[0]
+
+                    k_arclen = geometry.arclength[ns : nf + 1, k]
+                    k_geom = geometry.coordinates[ns : nf + 1, :, k]
+                    k_cpos = geometry.cpos[ns : nf + 1, k]
+
+                    self.web_arcs[ksw][0, k] = hp_arc
+                    self.web_arcs[ksw][1, k] = lp_arc
+                    self.web_cpos[ksw][0, k] = interpolator_wrap(k_arclen, k_cpos, hp_arc)
+                    self.web_cpos[ksw][1, k] = interpolator_wrap(k_arclen, k_cpos, lp_arc)
+                    self.web_points[ksw][0, :, k] = interpolator_wrap(k_arclen, k_geom, hp_arc)
+                    self.web_points[ksw][1, :, k] = interpolator_wrap(k_arclen, k_geom, lp_arc)
+                continue
 
             # get hp extents
             hpextents = np.unique([comp.hpextents for comp in ksw_cmpts]).tolist()
@@ -538,6 +625,14 @@ class KeyPoints:
                 b2 = np.diff(ob, axis=0)
                 base1 = np.sqrt(np.sum(b1**2, 1))[0]
                 base2 = np.sqrt(np.sum(b2**2, 1))[0]
+                if base1 <= np.finfo(float).eps or base2 <= np.finfo(float).eps:
+                    # WindIO web definitions can taper to a point near the root
+                    # or tip.  Treat the degenerate segment as zero area instead
+                    # of dividing by zero while computing the panel normal.
+                    self.web_areas[ksw][kc] = 0.0
+                    self.web_width[ksw][kc] = base1
+                    self.web_bonds[ksw][0:2, kc] = np.sqrt(np.sum((ob - ib) ** 2, 1))
+                    continue
                 b1 = b1 / base1
                 b2 = b2 / base2
                 h1 = float(np.abs(np.dot((ob[0, :] - ib[0, :]), (1 - np.squeeze(b1)))))

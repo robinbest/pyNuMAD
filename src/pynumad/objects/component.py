@@ -21,6 +21,13 @@ class Component:
         Array of keypoints such as ['b','c']
     lpextents : list
         String Array: Array of keypoints such as ['b','c']
+    web : str
+        WindIO web name for shear-web components, such as ``web0``.  When this
+        is present, the web geometry should come from the YAML web definition
+        rather than from name-based keypoint guesses.
+    web_start_nd_arc, web_end_nd_arc : np.ndarray
+        WindIO normalized arclength locations for the HP and LP ends of this
+        shear web.  Values are stored on the blade analysis-station grid.
     control_points : np
         control points defining layer distribution
     imethod: str
@@ -37,6 +44,9 @@ class Component:
         self.fabricangle: float = None
         self.hpextents: list = None
         self.lpextents: list = None
+        self.web: str = None
+        self.web_start_nd_arc: np.ndarray = None
+        self.web_end_nd_arc: np.ndarray = None
         self.control_points: np.ndarray = None
         self.imethod: str = "linear"
         self.pinnedends: bool = None

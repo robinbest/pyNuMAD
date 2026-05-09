@@ -1850,9 +1850,16 @@ def _web_regions(blade, station, transformer, cs_params, shell_regions):
     if hp_spar_region is None or lp_spar_region is None:
         return regions
 
-    hp_interface_edges = []
-    lp_interface_edges = []
-    stack_station = min(station, stackdb.swstacks.shape[1] - 1)
+    hp_side_regions = _innermost_side_regions(shell_regions, "HP")
+    lp_side_regions = _innermost_side_regions(shell_regions, "LP")
+    hp_interface_edges = {}
+    lp_interface_edges = {}
+    if station >= stackdb.swstacks.shape[1]:
+        # StackDB omits the final station when the web thickness tapers to
+        # zero.  Do not reuse the previous station's web laminate there; that
+        # creates duplicate/near-coincident webs at the blade tip.
+        return regions
+    stack_station = station
     for i_web in range(stackdb.swstacks.shape[0]):
         if i_web >= stackdb.swstacks.shape[0]:
             break
@@ -1864,14 +1871,36 @@ def _web_regions(blade, station, transformer, cs_params, shell_regions):
         if web_thickness <= 0:
             continue
 
+        web_points = (
+            transformer.points(blade.keypoints.web_points[i_web][:, :, station])
+            if _web_has_explicit_yaml_geometry(blade, i_web) and i_web < len(blade.keypoints.web_points)
+            else None
+        )
+        hp_attach_region = hp_spar_region
+        lp_attach_region = lp_spar_region
+        if web_points is not None:
+            # YAML-defined webs are not guaranteed to land on the spar-cap
+            # stack.  Choose the shell segment from the outer-surface web
+            # location, then attach to that segment's inner edge.  Selecting by
+            # inner-edge distance alone can jump across a stack boundary after
+            # laminate offsets are applied, which makes webs miss the thick
+            # spar-cap faces even when the YAML arcs lie inside them.
+            hp_attach_region = _nearest_outer_region(hp_side_regions, web_points[0]) or hp_spar_region
+            lp_attach_region = _nearest_outer_region(lp_side_regions, web_points[1]) or lp_spar_region
+            if _web_endpoint_is_inside_spar_arc(blade, i_web, station, "HP"):
+                hp_attach_region = hp_spar_region
+            if _web_endpoint_is_inside_spar_arc(blade, i_web, station, "LP"):
+                lp_attach_region = lp_spar_region
+
         interfaces = _spar_web_interfaces(
-            hp_spar_region.inner_points,
-            lp_spar_region.inner_points,
+            hp_attach_region.inner_points,
+            lp_attach_region.inner_points,
             station,
             transformer,
             cs_params,
             i_web,
             web_stack,
+            web_points,
         )
         if interfaces is None:
             continue
@@ -1883,8 +1912,12 @@ def _web_regions(blade, station, transformer, cs_params, shell_regions):
         hp_adhesive_edges, hp_web_edges = _web_connection_edges(hp_edges, lp_edges, transformer, cs_params, station, i_web)
         lp_adhesive_edges, lp_web_edges = _web_connection_edges(lp_edges, hp_edges, transformer, cs_params, station, i_web)
 
-        hp_interface_edges.append(_join_connected_edges(_connected_edge_order(hp_adhesive_edges, hp_web_edges)[0]))
-        lp_interface_edges.append(_join_connected_edges(_connected_edge_order(lp_adhesive_edges, lp_web_edges)[0]))
+        hp_interface_edges.setdefault(id(hp_attach_region), (hp_attach_region, []) )[1].append(
+            _join_connected_edges(_connected_edge_order(hp_adhesive_edges, hp_web_edges)[0])
+        )
+        lp_interface_edges.setdefault(id(lp_attach_region), (lp_attach_region, []) )[1].append(
+            _join_connected_edges(_connected_edge_order(lp_adhesive_edges, lp_web_edges)[0])
+        )
 
         regions.extend(_web_laminate_regions(station, i_web, hp_web_edges, lp_web_edges, web_stack, transformer))
         regions.extend(
@@ -1899,8 +1932,10 @@ def _web_regions(blade, station, transformer, cs_params, shell_regions):
             )
         )
 
-    _split_region_inner_edge_for_interfaces(hp_spar_region, hp_interface_edges)
-    _split_region_inner_edge_for_interfaces(lp_spar_region, lp_interface_edges)
+    for region, interface_edges in hp_interface_edges.values():
+        _split_region_inner_edge_for_interfaces(region, interface_edges)
+    for region, interface_edges in lp_interface_edges.values():
+        _split_region_inner_edge_for_interfaces(region, interface_edges)
     return regions
 
 
@@ -1917,7 +1952,60 @@ def _innermost_spar_region(shell_regions, blade, station, side, stack_index):
     return max(candidates, key=lambda region: _layer_index_from_name(region.name) or 0)
 
 
-def _spar_web_interfaces(hp_inner_spar, lp_inner_spar, station, transformer, cs_params, i_web, web_stack):
+def _innermost_side_regions(shell_regions, side):
+    """Return the innermost generated shell layer for each stack on one side."""
+
+    by_stack = {}
+    for region in shell_regions:
+        if f"_{side}_" not in region.name or region.inner_points is None:
+            continue
+        stack_name = region.name.rsplit("_layer", 1)[0]
+        current = by_stack.get(stack_name)
+        if current is None or (_layer_index_from_name(region.name) or 0) > (_layer_index_from_name(current.name) or 0):
+            by_stack[stack_name] = region
+    return list(by_stack.values())
+
+
+def _nearest_outer_region(regions, point):
+    """Find the shell region whose outer curve is closest to a point."""
+
+    best_region = None
+    best_distance = float("inf")
+    for region in regions:
+        distance = _distance_to_polyline(region.outer_points, point)
+        if distance < best_distance:
+            best_distance = distance
+            best_region = region
+    return best_region
+
+
+def _web_has_explicit_yaml_geometry(blade, i_web):
+    """Return whether this web group came from WindIO start/end_nd_arc data."""
+
+    components = blade.definition.components.values()
+    return any(
+        component.group == i_web + 1
+        and component.web_start_nd_arc is not None
+        and component.web_end_nd_arc is not None
+        for component in components
+    )
+
+
+def _web_endpoint_is_inside_spar_arc(blade, i_web, station, side, tolerance=1e-9):
+    """Return whether a YAML web endpoint falls inside the spar-cap arc bounds."""
+
+    if i_web >= len(blade.keypoints.web_arcs):
+        return False
+    if side == "HP":
+        web_arc = blade.keypoints.web_arcs[i_web][0, station]
+        spar_arcs = blade.keypoints.key_arcs[[3, 4], station]
+    else:
+        web_arc = blade.keypoints.web_arcs[i_web][1, station]
+        spar_arcs = blade.keypoints.key_arcs[[8, 9], station]
+    return min(spar_arcs) - tolerance <= web_arc <= max(spar_arcs) + tolerance
+
+
+def _spar_web_interfaces(hp_inner_spar, lp_inner_spar, station, transformer, cs_params, i_web, web_stack, web_points=None):
     """Return HP/LP interface edge intervals for one shear web.
 
     Layer widths come from web ply thicknesses.  The interface center is inset
@@ -1946,19 +2034,28 @@ def _spar_web_interfaces(hp_inner_spar, lp_inner_spar, station, transformer, cs_
     if inset <= 1e-9:
         return None
 
-    if i_web == 0:
+    if web_points is not None:
+        # Prefer pyNuMAD/WindIO web keypoints when they are available.  The old
+        # FreeCAD generator only had two locations: web 0 at one spar end and
+        # every other web at the opposite end.  That hid additional YAML webs by
+        # drawing them on top of each other.  Projecting each web endpoint onto
+        # the innermost spar curves keeps any number of web stacks distinct.
+        hp_center = _project_point_to_polyline(hp_inner_spar, web_points[0])
+        lp_center = _project_point_to_polyline(lp_inner_spar, web_points[1])
+    elif i_web == 0:
         hp_center = hp_length - inset
         lp_center = inset
     else:
         hp_center = inset
         lp_center = lp_length - inset
 
-    hp_intervals = _centered_intervals(hp_length, hp_center, layer_widths)
+    boundary_clearance = _web_boundary_clearance(web_thickness, adhesive_width, hp_length, lp_length)
+    hp_intervals = _centered_intervals(hp_length, hp_center, layer_widths, boundary_clearance)
     # The HP and LP spar curves run in opposite physical directions around the
     # section.  Build the LP intervals from reversed widths, then restore
     # plygroup order, so each web layer connects to a same-thickness interval
     # without crossing the outer web layers.
-    lp_intervals = list(reversed(_centered_intervals(lp_length, lp_center, list(reversed(layer_widths)))))
+    lp_intervals = list(reversed(_centered_intervals(lp_length, lp_center, list(reversed(layer_widths)), boundary_clearance)))
     if not hp_intervals or not lp_intervals:
         return None
 
@@ -1967,7 +2064,24 @@ def _spar_web_interfaces(hp_inner_spar, lp_inner_spar, station, transformer, cs_
     return hp_edges, lp_edges
 
 
-def _centered_intervals(length, center, widths):
+def _web_boundary_clearance(web_thickness, adhesive_width, hp_length, lp_length):
+    """Return a small clearance from shell-region boundaries for web layers.
+
+    Near the blade tip, a YAML web endpoint can lie just inside a spar-cap
+    interval.  If the laminate-width interval is clipped flush to the spar/panel
+    boundary, one side of the web core can cut across the neighboring panel.
+    Use a modest clearance when the spar segment has enough room, but let very
+    short segments fall back to zero clearance instead of deleting the web.
+    """
+
+    available_length = min(hp_length, lp_length)
+    requested = max(adhesive_width, 0.25 * web_thickness, 0.002)
+    if web_thickness + 2.0 * requested <= 0.95 * available_length:
+        return requested
+    return 0.0
+
+
+def _centered_intervals(length, center, widths, boundary_clearance=0.0):
     """Place consecutive layer-width intervals around a center distance.
 
     If the requested total width exceeds the available curve length, widths are
@@ -1985,7 +2099,9 @@ def _centered_intervals(length, center, widths):
         total_width = sum(widths)
 
     start = center - 0.5 * total_width
-    start = float(np.clip(start, 0.0, max(length - total_width, 0.0)))
+    lower = min(boundary_clearance, max(length - total_width, 0.0))
+    upper = max(length - total_width - boundary_clearance, lower)
+    start = float(np.clip(start, lower, upper))
     intervals = []
     for width in widths:
         end = start + width
@@ -2394,6 +2510,13 @@ def _project_point_to_polyline(points, point):
             best_distance = distance
             best_s = cumulative[i] + t * np.sqrt(length_squared)
     return best_s
+
+
+def _distance_to_polyline(points, point):
+    """Return the shortest distance from a point to a polyline."""
+
+    projected = _point_at_distance(points, _project_point_to_polyline(points, point))
+    return float(np.linalg.norm(point - projected))
 
 
 def _point_at_distance(points, distance):
