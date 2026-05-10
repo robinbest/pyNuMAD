@@ -75,9 +75,9 @@ keeps only its station-local ``FaceMaterialMap`` and ``StationFrame``.
 from all materials in the YAML file.  Laminate definitions are deduplicated
 from the full blade ``StackDB`` across all stations, not only from the station
 subset selected for export, so the tables represent the whole turbine design.
-The lightweight ``yaml_station_count()`` helper reads the YAML station arrays
-directly and can be used by user interfaces before creating full cross-section
-geometry.
+The lightweight ``get_yaml_station_count()`` helper reads the YAML station
+arrays directly and can be used by user interfaces before creating full
+cross-section geometry.  ``yaml_station_count()`` is kept as a shorter alias.
 
 Station frames
 ~~~~~~~~~~~~~~

@@ -656,6 +656,17 @@ def yaml_station_count(yaml_path):
     raise ValueError("YAML file does not define any recognized blade station arrays")
 
 
+def get_yaml_station_count(yaml_path):
+    """Lightweight public API for HomoGen station-range dialogs.
+
+    This is an explicit alias for :func:`yaml_station_count`, provided so UI
+    code can ask for the station count before importing/generating FreeCAD
+    cross-section geometry.
+    """
+
+    return yaml_station_count(yaml_path)
+
+
 def station_frame_definition(blade, station):
     """Return reference-axis orientation data for one blade station.
 

@@ -6,6 +6,7 @@ from .make_cross_sections import (
     face_material_metadata,
     get_cross_section,
     get_detailed_cross_section,
+    get_yaml_station_count,
     global_laminate_definitions,
     laminate_definitions,
     material_definitions,

@@ -6,6 +6,7 @@ from pynumad.analysis.freecad import (
     face_material_metadata,
     get_cross_section,
     get_detailed_cross_section,
+    get_yaml_station_count,
     global_laminate_definitions,
     laminate_definitions,
     material_definitions,
@@ -265,6 +266,7 @@ def test_yaml_station_count_is_lightweight_and_matches_imported_blade():
     blade = pynumad.Blade(yaml_path)
 
     assert yaml_station_count(yaml_path) == 30
+    assert get_yaml_station_count(yaml_path) == 30
     assert yaml_station_count(yaml_path) == blade_station_count(blade)
 
 
