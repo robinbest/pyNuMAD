@@ -13,7 +13,11 @@ For shell models, the in-house mesher takes an option for whether to include the
 FreeCAD and HomoGen cross sections
 ----------------------------------
 
-The FreeCAD cross-section export builds one stitched 2D object per selected blade station.  In detailed mode, each face carries JSON metadata for ``FaceMaterialMap``, ``LaminateDefinitions``, and ``MaterialDefinitions`` under the FreeCAD ``Turbine`` property group.
+The FreeCAD cross-section export builds one stitched 2D object per selected
+blade station.  In detailed mode, each station face carries ``FaceMaterialMap``
+metadata under the FreeCAD ``Turbine`` property group, while material and
+laminate definition tables live once on the document-level
+``TurbineMetadata`` object.
 
 Sharp or nearly closed trailing edges are treated as bonded joints: the HP and LP shell laminates are trimmed before they touch, and a ``Station###_TE_adhesive`` face closes the small trailing-edge gap.  Flatback stations are handled differently, following the Cubit workflow.  When the HP/LP trailing-edge opening is large, the outer flatback wall is preserved and a ``Station###_flatTEadhesive`` face is created from that wall to the trimmed HP/LP shell ends.  This prevents a broad flatback from being mistaken for a sharp trailing edge and gives the shell and adhesive regions shared edges at the flatback corners.
 
@@ -56,6 +60,24 @@ Some legacy example YAML files contain ``webs`` entries without
 ``start_nd_arc``/``end_nd_arc``.  Those files can still describe materials and
 shell laminates, but they are incomplete for explicit FreeCAD/HomoGen web
 placement and will report a load error identifying the missing web arcs.
+
+Turbine metadata
+~~~~~~~~~~~~~~~~
+
+Detailed FreeCAD exports store material and laminate definitions once at the
+turbine level instead of repeating them on every station object.  The generated
+document contains a ``TurbineMetadata`` object with ``MaterialDefinitions``,
+``LaminateDefinitions``, and ``StationCount`` properties.  Each station object
+keeps only its station-local ``FaceMaterialMap`` and ``StationFrame``.
+
+``FaceMaterialMap`` entries reference the turbine-level tables with
+``assignment_type`` and ``assignment_index``.  Material definitions are read
+from all materials in the YAML file.  Laminate definitions are deduplicated
+from the full blade ``StackDB`` across all stations, not only from the station
+subset selected for export, so the tables represent the whole turbine design.
+The lightweight ``yaml_station_count()`` helper reads the YAML station arrays
+directly and can be used by user interfaces before creating full cross-section
+geometry.
 
 Station frames
 ~~~~~~~~~~~~~~

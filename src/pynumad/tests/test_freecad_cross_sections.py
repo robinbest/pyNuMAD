@@ -2,15 +2,18 @@ import pynumad
 import numpy as np
 
 from pynumad.analysis.freecad import (
+    blade_station_count,
     face_material_metadata,
     get_cross_section,
     get_detailed_cross_section,
+    global_laminate_definitions,
     laminate_definitions,
     material_definitions,
     make_freecad_cross_section_parts,
     make_freecad_section_part,
     station_frame_definition,
     write_freecad_cross_sections,
+    yaml_station_count,
 )
 
 
@@ -145,6 +148,7 @@ def test_face_material_metadata_uses_fixed_snake_case_schema():
         "region_name",
         "material_name",
         "assignment_type",
+        "assignment_index",
         "assignment_name",
     }
 
@@ -153,6 +157,34 @@ def test_face_material_metadata_uses_fixed_snake_case_schema():
     assert all(key == key.lower() for key in expected_keys)
     assert all("_" in key or key in {"side", "layer", "station"} for key in expected_keys)
     assert all("RegionName" not in item and "Feature" not in item for item in metadata)
+
+
+def test_face_material_metadata_can_reference_global_turbine_tables():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 7, move_le_to_origin=True)
+    laminate_table = global_laminate_definitions(blade)
+    material_table = material_definitions(blade)
+    metadata = face_material_metadata(
+        section.regions,
+        laminate_table=laminate_table,
+        material_table=material_table,
+    )
+    laminate_names = {item["laminate_name"] for item in laminate_table}
+    material_indices = {item["material_name"]: item["material_index"] for item in material_table}
+
+    assert laminate_table
+    assert all(item["assignment_index"] is not None for item in metadata)
+    assert all(
+        item["assignment_name"] in laminate_names
+        for item in metadata
+        if item["assignment_type"] == "laminate"
+    )
+    assert all(
+        item["assignment_index"] == material_indices[item["material_name"]]
+        for item in metadata
+        if item["assignment_type"] == "material"
+    )
 
 
 def test_face_material_metadata_expands_repeated_plygroups_for_homogen():
@@ -216,6 +248,7 @@ def test_material_definitions_include_elastic_density_and_thermal_data():
     materials = material_definitions(blade)
     by_name = {item["material_name"]: item for item in materials}
 
+    assert [item["material_index"] for item in materials] == list(range(len(materials)))
     assert by_name["glass_triax"]["material_type"] == "orthotropic"
     assert by_name["glass_triax"]["density"] == 1940.0
     assert by_name["glass_triax"]["elastic"]["e1"] == 28211400000.0
@@ -225,6 +258,14 @@ def test_material_definitions_include_elastic_density_and_thermal_data():
     assert by_name["Gelcoat"]["thermal"]["expansion_coefficient"] == 0.0
     assert by_name["Gelcoat"]["strength"]["compressive"] == 10000000000.0
     assert "thermal" not in by_name["glass_triax"]
+
+
+def test_yaml_station_count_is_lightweight_and_matches_imported_blade():
+    yaml_path = "examples/example_data/myBlade_Modified.yaml"
+    blade = pynumad.Blade(yaml_path)
+
+    assert yaml_station_count(yaml_path) == 30
+    assert yaml_station_count(yaml_path) == blade_station_count(blade)
 
 
 def test_detailed_webs_connect_spar_boundaries():
@@ -690,9 +731,12 @@ def test_write_detailed_freecad_cross_sections_script(tmp_path):
     assert "face_between_curves" in contents
     assert "sewShape" in contents
     assert "FaceMaterialMap" in contents
+    assert "TurbineMetadata" in contents
     assert "LaminateDefinitions" in contents
     assert "MaterialDefinitions" in contents
+    assert "StationCount" in contents
     assert "face_index" in contents
+    assert "assignment_index" in contents
     assert '"station"' in contents
     assert '"side"' in contents
     assert '"web_index"' in contents
