@@ -406,18 +406,31 @@ def make_freecad_section_part(
         section_obj = doc.addObject("Part::Feature", obj_name)
         section_obj.Shape = _freecad_stitched_section_shape(face_shapes, Part)
         section_obj.Label = f"Station {section.station:03d}"
+        face_ordered_regions, face_map_diagnostics = _regions_in_shape_face_order_with_diagnostics(
+            section.regions,
+            face_shapes,
+            section_obj.Shape,
+            station=section.station,
+        )
         _set_string_property(
             section_obj,
             "FaceMaterialMap",
             json.dumps(
                 face_material_metadata(
-                    section.regions,
+                    face_ordered_regions,
                     laminate_table=laminate_table,
                     material_table=material_table,
                 )
             ),
             group="Turbine",
             description="JSON map from face index to material metadata",
+        )
+        _set_string_property(
+            section_obj,
+            "FaceMaterialMapDiagnostics",
+            json.dumps(face_map_diagnostics),
+            group="Turbine",
+            description="JSON diagnostics for FreeCAD face-index/material-map verification",
         )
         _set_string_property(
             section_obj,
@@ -496,6 +509,122 @@ def face_material_metadata(regions, *, laminate_table=None, material_table=None)
         )
         metadata.append(item)
     return metadata
+
+
+def _regions_in_shape_face_order(regions, source_faces, stitched_shape):
+    """Return regions reordered to match the actual FreeCAD ``Shape.Faces`` list."""
+
+    ordered_regions, _ = _regions_in_shape_face_order_with_diagnostics(
+        regions,
+        source_faces,
+        stitched_shape,
+    )
+    return ordered_regions
+
+
+def _regions_in_shape_face_order_with_diagnostics(regions, source_faces, stitched_shape, *, station=None):
+    """Return regions reordered to match the actual FreeCAD ``Shape.Faces`` list.
+
+    ``Part.makeCompound`` followed by ``sewShape`` can reorder faces.  The
+    material map is consumed through FreeCAD face indices, so match each sewn
+    face back to its source face using simple geometric signatures.  The
+    diagnostics payload is stored downstream so callers can decide whether to
+    warn the user or stop a material-assignment workflow.
+    """
+
+    shape_faces = list(getattr(stitched_shape, "Faces", []) or [])
+    regions = list(regions or [])
+    source_faces = list(source_faces or [])
+    diagnostics = _face_map_diagnostics(station=station)
+    if len(shape_faces) != len(regions) or len(source_faces) != len(regions):
+        _add_face_map_diagnostic(
+            diagnostics,
+            "error",
+            "face_count_mismatch",
+            (
+                "FaceMaterialMap face-order verification failed because the generated region count, "
+                "source face count, and stitched FreeCAD face count do not match. The map was written "
+                "in region-generation order and may not match FreeCAD Face indices."
+            ),
+            region_count=len(regions),
+            source_face_count=len(source_faces),
+            stitched_face_count=len(shape_faces),
+        )
+        return regions, diagnostics
+
+    source_signatures = [_face_signature(face) for face in source_faces]
+    shape_signatures = [_face_signature(face) for face in shape_faces]
+    if any(signature is None for signature in source_signatures + shape_signatures):
+        _add_face_map_diagnostic(
+            diagnostics,
+            "warning",
+            "face_signature_unavailable",
+            (
+                "FaceMaterialMap face-order verification was skipped because at least one FreeCAD "
+                "face did not expose area and center-of-mass data. The map was written in "
+                "region-generation order and should be checked before assigning materials."
+            ),
+            region_count=len(regions),
+            source_face_count=len(source_faces),
+            stitched_face_count=len(shape_faces),
+        )
+        return regions, diagnostics
+
+    unused = set(range(len(source_signatures)))
+    ordered = []
+    for shape_signature in shape_signatures:
+        best_index = min(
+            unused,
+            key=lambda index: _face_signature_distance(shape_signature, source_signatures[index]),
+        )
+        unused.remove(best_index)
+        ordered.append(regions[best_index])
+    diagnostics["face_order_verified"] = True
+    diagnostics["message"] = "FaceMaterialMap order was verified against FreeCAD Shape.Faces using area and center-of-mass signatures."
+    return ordered, diagnostics
+
+
+def _face_map_diagnostics(*, station=None):
+    return {
+        "schema_version": 1,
+        "station": station,
+        "face_order_verified": False,
+        "message": "FaceMaterialMap order has not been verified against FreeCAD Shape.Faces.",
+        "warnings": [],
+        "errors": [],
+    }
+
+
+def _add_face_map_diagnostic(diagnostics, severity, code, message, **details):
+    item = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+    }
+    if details:
+        item["details"] = details
+    diagnostics[f"{severity}s"].append(item)
+    diagnostics["message"] = message
+
+
+def _face_signature(face):
+    try:
+        center = getattr(face, "CenterOfMass")
+        return (
+            float(getattr(face, "Area")),
+            float(center.x),
+            float(center.y),
+            float(center.z),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _face_signature_distance(first, second):
+    area_scale = max(abs(first[0]), abs(second[0]), 1.0)
+    area_error = abs(first[0] - second[0]) / area_scale
+    center_error = sum((first[index] - second[index]) ** 2 for index in range(1, 4)) ** 0.5
+    return area_error + center_error
 
 
 def laminate_definitions(regions):
@@ -3390,6 +3519,107 @@ def stitched_section_shape(faces):
     return shape
 
 
+def regions_in_shape_face_order(regions, source_faces, stitched_shape):
+    ordered_regions, diagnostics = regions_in_shape_face_order_with_diagnostics(regions, source_faces, stitched_shape)
+    return ordered_regions
+
+
+def regions_in_shape_face_order_with_diagnostics(regions, source_faces, stitched_shape, station=None):
+    shape_faces = list(getattr(stitched_shape, "Faces", []) or [])
+    regions = list(regions or [])
+    source_faces = list(source_faces or [])
+    diagnostics = face_map_diagnostics(station)
+    if len(shape_faces) != len(regions) or len(source_faces) != len(regions):
+        add_face_map_diagnostic(
+            diagnostics,
+            "error",
+            "face_count_mismatch",
+            (
+                "FaceMaterialMap face-order verification failed because the generated region count, "
+                "source face count, and stitched FreeCAD face count do not match. The map was written "
+                "in region-generation order and may not match FreeCAD Face indices."
+            ),
+            region_count=len(regions),
+            source_face_count=len(source_faces),
+            stitched_face_count=len(shape_faces),
+        )
+        return regions, diagnostics
+
+    source_signatures = [face_signature(face) for face in source_faces]
+    shape_signatures = [face_signature(face) for face in shape_faces]
+    if any(signature is None for signature in source_signatures + shape_signatures):
+        add_face_map_diagnostic(
+            diagnostics,
+            "warning",
+            "face_signature_unavailable",
+            (
+                "FaceMaterialMap face-order verification was skipped because at least one FreeCAD "
+                "face did not expose area and center-of-mass data. The map was written in "
+                "region-generation order and should be checked before assigning materials."
+            ),
+            region_count=len(regions),
+            source_face_count=len(source_faces),
+            stitched_face_count=len(shape_faces),
+        )
+        return regions, diagnostics
+
+    unused = set(range(len(source_signatures)))
+    ordered = []
+    for shape_signature in shape_signatures:
+        best_index = min(
+            unused,
+            key=lambda index: face_signature_distance(shape_signature, source_signatures[index]),
+        )
+        unused.remove(best_index)
+        ordered.append(regions[best_index])
+    diagnostics["face_order_verified"] = True
+    diagnostics["message"] = "FaceMaterialMap order was verified against FreeCAD Shape.Faces using area and center-of-mass signatures."
+    return ordered, diagnostics
+
+
+def face_map_diagnostics(station=None):
+    return {{
+        "schema_version": 1,
+        "station": station,
+        "face_order_verified": False,
+        "message": "FaceMaterialMap order has not been verified against FreeCAD Shape.Faces.",
+        "warnings": [],
+        "errors": [],
+    }}
+
+
+def add_face_map_diagnostic(diagnostics, severity, code, message, **details):
+    item = {{
+        "severity": severity,
+        "code": code,
+        "message": message,
+    }}
+    if details:
+        item["details"] = details
+    diagnostics[severity + "s"].append(item)
+    diagnostics["message"] = message
+
+
+def face_signature(face):
+    try:
+        center = getattr(face, "CenterOfMass")
+        return (
+            float(getattr(face, "Area")),
+            float(center.x),
+            float(center.y),
+            float(center.z),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def face_signature_distance(first, second):
+    area_scale = max(abs(first[0]), abs(second[0]), 1.0)
+    area_error = abs(first[0] - second[0]) / area_scale
+    center_error = sum((first[index] - second[index]) ** 2 for index in range(1, 4)) ** 0.5
+    return area_error + center_error
+
+
 def parsed_region_name(name):
     parts = name.split("_")
     parsed = dict(
@@ -3533,8 +3763,11 @@ for section in DATA["sections"]:
         stitched_obj = doc.addObject("Part::Feature", "Station{{:03d}}_section".format(station))
         stitched_obj.Shape = stitched_section_shape(section_faces)
         stitched_obj.Label = "Station {{:03d}}".format(station)
+        face_ordered_regions, face_map_diagnostics_obj = regions_in_shape_face_order_with_diagnostics(section["regions"], section_faces, stitched_obj.Shape, station=station)
         stitched_obj.addProperty("App::PropertyString", "FaceMaterialMap", "Turbine", "JSON map from face index to material metadata")
-        stitched_obj.FaceMaterialMap = json.dumps(face_metadata(section["regions"], DATA["laminate_definitions"], DATA["material_definitions"]))
+        stitched_obj.FaceMaterialMap = json.dumps(face_metadata(face_ordered_regions, DATA["laminate_definitions"], DATA["material_definitions"]))
+        stitched_obj.addProperty("App::PropertyString", "FaceMaterialMapDiagnostics", "Turbine", "JSON diagnostics for FreeCAD face-index/material-map verification")
+        stitched_obj.FaceMaterialMapDiagnostics = json.dumps(face_map_diagnostics_obj)
         stitched_obj.addProperty("App::PropertyString", "StationFrame", "Turbine", "JSON station reference-axis origin, rotations, and local coordinate system")
         stitched_obj.StationFrame = json.dumps(section.get("station_frame", {{}}))
         if hasattr(stitched_obj, "ViewObject") and stitched_obj.ViewObject is not None:
