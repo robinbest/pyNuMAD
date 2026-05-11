@@ -1,17 +1,75 @@
+import json
+
 import pynumad
 import numpy as np
 
 from pynumad.analysis.freecad import (
+    blade_station_count,
     face_material_metadata,
     get_cross_section,
     get_detailed_cross_section,
+    get_yaml_station_count,
+    global_laminate_definitions,
     laminate_definitions,
+    load_blade_for_freecad,
     material_definitions,
     make_freecad_cross_section_parts,
     make_freecad_section_part,
+    record_turbine_message,
     station_frame_definition,
     write_freecad_cross_sections,
+    yaml_station_count,
 )
+from pynumad.analysis.freecad.make_cross_sections import (
+    _regions_in_shape_face_order,
+    _regions_in_shape_face_order_with_messages,
+)
+
+
+class _FakeCenter:
+    def __init__(self, x, y, z=0.0):
+        self.x = x
+        self.y = y
+        self.z = z
+
+
+class _FakeFace:
+    def __init__(self, area, center):
+        self.Area = area
+        self.CenterOfMass = _FakeCenter(*center)
+
+
+class _FakeShape:
+    def __init__(self, faces):
+        self.Faces = faces
+
+
+class _FakeFaceWithoutSignature:
+    pass
+
+
+class _FakeFreeCADObject:
+    def __init__(self, name):
+        self.Name = name
+        self.Label = name
+        self.PropertiesList = []
+
+    def addProperty(self, _type_name, name, _group="", _description=""):
+        if name not in self.PropertiesList:
+            self.PropertiesList.append(name)
+
+
+class _FakeFreeCADDoc:
+    def __init__(self):
+        self.objects = {}
+
+    def getObject(self, name):
+        return self.objects.get(name)
+
+    def addObject(self, _type_name, name):
+        obj = _FakeFreeCADObject(name)
+        self.objects[name] = obj
+        return obj
 
 
 def test_get_cross_section_splits_hp_and_lp_surfaces():
@@ -44,6 +102,8 @@ def test_write_freecad_cross_sections_script(tmp_path):
     assert "Station{:03d}_wire" in contents
     assert '"station_frame"' in contents
     assert "StationFrame" in contents
+    assert "WarningMessages" in contents
+    assert "ErrorMessages" in contents
 
 
 def test_get_detailed_cross_section_has_shell_and_web_regions():
@@ -145,6 +205,7 @@ def test_face_material_metadata_uses_fixed_snake_case_schema():
         "region_name",
         "material_name",
         "assignment_type",
+        "assignment_index",
         "assignment_name",
     }
 
@@ -153,6 +214,34 @@ def test_face_material_metadata_uses_fixed_snake_case_schema():
     assert all(key == key.lower() for key in expected_keys)
     assert all("_" in key or key in {"side", "layer", "station"} for key in expected_keys)
     assert all("RegionName" not in item and "Feature" not in item for item in metadata)
+
+
+def test_face_material_metadata_can_reference_global_turbine_tables():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 7, move_le_to_origin=True)
+    laminate_table = global_laminate_definitions(blade)
+    material_table = material_definitions(blade)
+    metadata = face_material_metadata(
+        section.regions,
+        laminate_table=laminate_table,
+        material_table=material_table,
+    )
+    laminate_names = {item["laminate_name"] for item in laminate_table}
+    material_indices = {item["material_name"]: item["material_index"] for item in material_table}
+
+    assert laminate_table
+    assert all(item["assignment_index"] is not None for item in metadata)
+    assert all(
+        item["assignment_name"] in laminate_names
+        for item in metadata
+        if item["assignment_type"] == "laminate"
+    )
+    assert all(
+        item["assignment_index"] == material_indices[item["material_name"]]
+        for item in metadata
+        if item["assignment_type"] == "material"
+    )
 
 
 def test_face_material_metadata_expands_repeated_plygroups_for_homogen():
@@ -210,12 +299,127 @@ def test_foam_core_faces_are_material_assignments_not_laminates():
     )
 
 
+def test_station_10_web0_core_is_face43_material_assignment():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    metadata = face_material_metadata(
+        section.regions,
+        laminate_table=global_laminate_definitions(blade),
+        material_table=material_definitions(blade),
+    )
+    web0_items = [item for item in metadata if item["region_name"].startswith("Station010_web0_layer")]
+
+    assert [(item["face_index"], item["region_name"], item["material_name"]) for item in web0_items] == [
+        (41, "Station010_web0_layer00", "glass_biax"),
+        (42, "Station010_web0_layer01", "medium_density_foam"),
+        (43, "Station010_web0_layer02", "glass_biax"),
+    ]
+    assert web0_items[1]["assignment_type"] == "material"
+    assert web0_items[1]["assignment_index"] == 5
+    assert web0_items[1]["assignment_name"] == "medium_density_foam"
+
+
+def test_face_material_regions_can_follow_reordered_freecad_faces():
+    regions = ["skin_a", "core", "skin_b"]
+    source_faces = [
+        _FakeFace(1.0, (0.0, 0.0)),
+        _FakeFace(3.0, (1.0, 0.0)),
+        _FakeFace(1.2, (2.0, 0.0)),
+    ]
+    stitched_shape = _FakeShape([source_faces[2], source_faces[0], source_faces[1]])
+
+    ordered = _regions_in_shape_face_order(regions, source_faces, stitched_shape)
+
+    assert ordered == ["skin_b", "skin_a", "core"]
+
+
+def test_face_material_reorder_returns_no_messages_when_verified():
+    regions = ["skin_a", "core", "skin_b"]
+    source_faces = [
+        _FakeFace(1.0, (0.0, 0.0)),
+        _FakeFace(3.0, (1.0, 0.0)),
+        _FakeFace(1.2, (2.0, 0.0)),
+    ]
+    stitched_shape = _FakeShape([source_faces[2], source_faces[0], source_faces[1]])
+
+    ordered, messages = _regions_in_shape_face_order_with_messages(
+        regions,
+        source_faces,
+        stitched_shape,
+        station=10,
+    )
+
+    assert ordered == ["skin_b", "skin_a", "core"]
+    assert messages == []
+
+
+def test_face_material_reorder_returns_warning_when_signatures_are_unavailable():
+    regions = ["skin_a", "core", "skin_b"]
+    source_faces = [
+        _FakeFace(1.0, (0.0, 0.0)),
+        _FakeFaceWithoutSignature(),
+        _FakeFace(1.2, (2.0, 0.0)),
+    ]
+    stitched_shape = _FakeShape(source_faces)
+
+    ordered, messages = _regions_in_shape_face_order_with_messages(
+        regions,
+        source_faces,
+        stitched_shape,
+        station=10,
+    )
+
+    assert ordered == regions
+    assert len(messages) == 1
+    assert messages[0]["severity"] == "warning"
+    assert messages[0]["code"] == "face_signature_unavailable"
+    assert messages[0]["station"] == 10
+    assert messages[0]["source"] == "freecad_cross_sections.face_material_map"
+    assert "region-generation order" in messages[0]["message"]
+
+
+def test_record_turbine_message_creates_metadata_error_channel():
+    doc = _FakeFreeCADDoc()
+
+    metadata_obj = record_turbine_message(
+        doc,
+        "error",
+        "blade_yaml_read_failed",
+        "YAML web missing arcs",
+        source="freecad_cross_sections.blade_load",
+        details={"yaml_file": "examples/example_data/V27_fromScan.yaml"},
+    )
+
+    assert metadata_obj is doc.getObject("TurbineMetadata")
+    assert json.loads(metadata_obj.WarningMessages) == []
+    errors = json.loads(metadata_obj.ErrorMessages)
+    assert errors[0]["code"] == "blade_yaml_read_failed"
+    assert errors[0]["source"] == "freecad_cross_sections.blade_load"
+    assert errors[0]["details"]["yaml_file"] == "examples/example_data/V27_fromScan.yaml"
+    assert json.loads(metadata_obj.MaterialDefinitions) == []
+    assert json.loads(metadata_obj.LaminateDefinitions) == []
+
+
+def test_load_blade_for_freecad_records_yaml_load_failure():
+    doc = _FakeFreeCADDoc()
+
+    blade = load_blade_for_freecad("examples/example_data/V27_fromScan.yaml", doc=doc)
+
+    assert blade is None
+    errors = json.loads(doc.getObject("TurbineMetadata").ErrorMessages)
+    assert errors[0]["code"] == "blade_yaml_read_failed"
+    assert errors[0]["details"]["exception_type"] == "ValueError"
+    assert "start_nd_arc and end_nd_arc" in errors[0]["message"]
+
+
 def test_material_definitions_include_elastic_density_and_thermal_data():
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
 
     materials = material_definitions(blade)
     by_name = {item["material_name"]: item for item in materials}
 
+    assert [item["material_index"] for item in materials] == list(range(len(materials)))
     assert by_name["glass_triax"]["material_type"] == "orthotropic"
     assert by_name["glass_triax"]["density"] == 1940.0
     assert by_name["glass_triax"]["elastic"]["e1"] == 28211400000.0
@@ -225,6 +429,15 @@ def test_material_definitions_include_elastic_density_and_thermal_data():
     assert by_name["Gelcoat"]["thermal"]["expansion_coefficient"] == 0.0
     assert by_name["Gelcoat"]["strength"]["compressive"] == 10000000000.0
     assert "thermal" not in by_name["glass_triax"]
+
+
+def test_yaml_station_count_is_lightweight_and_matches_imported_blade():
+    yaml_path = "examples/example_data/myBlade_Modified.yaml"
+    blade = pynumad.Blade(yaml_path)
+
+    assert yaml_station_count(yaml_path) == 30
+    assert get_yaml_station_count(yaml_path) == 30
+    assert yaml_station_count(yaml_path) == blade_station_count(blade)
 
 
 def test_detailed_webs_connect_spar_boundaries():
@@ -690,9 +903,12 @@ def test_write_detailed_freecad_cross_sections_script(tmp_path):
     assert "face_between_curves" in contents
     assert "sewShape" in contents
     assert "FaceMaterialMap" in contents
+    assert "TurbineMetadata" in contents
     assert "LaminateDefinitions" in contents
     assert "MaterialDefinitions" in contents
+    assert "StationCount" in contents
     assert "face_index" in contents
+    assert "assignment_index" in contents
     assert '"station"' in contents
     assert '"side"' in contents
     assert '"web_index"' in contents

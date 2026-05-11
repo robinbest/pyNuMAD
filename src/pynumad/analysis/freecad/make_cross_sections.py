@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 
 @dataclass
@@ -259,7 +260,15 @@ def write_freecad_cross_sections(
         "export_step": export_step,
         "fcstd_path": os.fspath(out_dir / f"{wt_name}_cross_sections.FCStd"),
         "step_path": os.fspath(out_dir / f"{wt_name}_cross_sections.step"),
+        "station_count": blade_station_count(blade),
         "material_definitions": material_definitions(blade) if detailed else [],
+        "laminate_definitions": global_laminate_definitions(
+            blade,
+            geometry_scaling=geometry_scaling,
+            normalize_chord=normalize_chord,
+        )
+        if detailed
+        else [],
         "sections": [
             {
                 "station": section.station,
@@ -311,8 +320,29 @@ def make_freecad_cross_section_parts(
         App, _ = _require_freecad_modules()
         doc = App.ActiveDocument or App.newDocument("pyNuMAD_cross_sections")
 
+    material_table = material_definitions(blade) if detailed else []
+    laminate_table = (
+        global_laminate_definitions(
+            blade,
+            geometry_scaling=geometry_scaling,
+            normalize_chord=normalize_chord,
+        )
+        if detailed
+        else []
+    )
+    if detailed:
+        metadata_obj = _make_turbine_metadata_object(
+            doc,
+            material_table=material_table,
+            laminate_table=laminate_table,
+            station_count=blade_station_count(blade),
+        )
+    else:
+        metadata_obj = None
+
     section_builder = get_detailed_cross_section if detailed else get_cross_section
     created = []
+    messages = []
     for station in station_list:
         kwargs = {
             "geometry_scaling": geometry_scaling,
@@ -322,26 +352,102 @@ def make_freecad_cross_section_parts(
         if detailed:
             kwargs["cs_params"] = cs_params
         section = section_builder(blade, station, **kwargs)
-        created.append(make_freecad_section_part(section, doc=doc, debug_faces=debug_faces))
+        created.append(
+            make_freecad_section_part(
+                section,
+                doc=doc,
+                debug_faces=debug_faces,
+                laminate_table=laminate_table,
+                material_table=material_table,
+                message_log=messages,
+            )
+        )
 
+    if metadata_obj is not None:
+        _set_turbine_messages(metadata_obj, messages)
     doc.recompute()
     return created
 
 
-def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False):
+def load_blade_for_freecad(yaml_file, *, doc=None):
+    """Load a pyNuMAD blade and record YAML/load failures on ``TurbineMetadata``.
+
+    This helper is intended for FreeCAD/HomoGen callers that need user-facing
+    error messages even when blade construction fails before section generation
+    can create station objects.
+    """
+
+    import pynumad
+
+    try:
+        return pynumad.Blade(yaml_file)
+    except Exception as exc:
+        record_turbine_message(
+            doc,
+            "error",
+            "blade_yaml_read_failed",
+            str(exc),
+            source="freecad_cross_sections.blade_load",
+            details={
+                "yaml_file": os.fspath(yaml_file),
+                "exception_type": type(exc).__name__,
+            },
+        )
+        return None
+
+
+def record_turbine_message(doc, severity, code, message, *, station=None, source=None, details=None):
+    """Append a warning/error message to the document-level ``TurbineMetadata``.
+
+    Messages are stored as JSON strings in ``WarningMessages`` and
+    ``ErrorMessages`` so downstream tools have one stable place to inspect
+    FreeCAD section-generation issues.
+    """
+
+    if doc is None:
+        App, _ = _require_freecad_modules()
+        doc = App.ActiveDocument or App.newDocument("pyNuMAD_cross_sections")
+    metadata_obj = _get_or_create_turbine_metadata_object(doc)
+    _initialize_turbine_metadata_defaults(metadata_obj)
+    _append_turbine_messages(
+        metadata_obj,
+        [
+            _generation_message(
+                severity,
+                code,
+                message,
+                station=station,
+                source=source,
+                **(details or {}),
+            )
+        ],
+    )
+    return metadata_obj
+
+
+def make_freecad_section_part(
+    section,
+    *,
+    doc=None,
+    name=None,
+    debug_faces=False,
+    laminate_table=None,
+    material_table=None,
+    message_log=None,
+):
     """Create one FreeCAD object from a pyNuMAD cross-section data object.
 
     Detailed sections become a sewn shell with one face per material region.
-    The returned object gets two JSON string properties:
+    The returned object gets station-local JSON string properties:
 
     * ``FaceMaterialMap``: one entry per ``obj.Shape.Faces`` item, with each
-      face assigned to either a material or a named laminate;
-    * ``LaminateDefinitions``: unique laminate ply stacks referenced by
-      ``FaceMaterialMap[*]["assignment_name"]``;
-    * ``MaterialDefinitions``: project-local material properties referenced by
-      material assignments and laminate ply entries;
+      face assigned to either a material or laminate table entry;
     * ``StationFrame``: station reference-axis origin, bend/sweep rotations,
       twist, and local coordinate system.
+
+    When ``laminate_table`` and ``material_table`` are provided, face metadata
+    references those turbine-level tables by index.  Standalone calls without
+    tables still get a section-local laminate table for diagnostics.
     """
 
     App, Part = _require_freecad_modules()
@@ -363,26 +469,30 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
         section_obj = doc.addObject("Part::Feature", obj_name)
         section_obj.Shape = _freecad_stitched_section_shape(face_shapes, Part)
         section_obj.Label = f"Station {section.station:03d}"
+        face_ordered_regions, face_map_messages = _regions_in_shape_face_order_with_messages(
+            section.regions,
+            face_shapes,
+            section_obj.Shape,
+            station=section.station,
+        )
+        if message_log is not None:
+            message_log.extend(face_map_messages)
+        elif face_map_messages:
+            metadata_obj = doc.getObject("TurbineMetadata") if hasattr(doc, "getObject") else None
+            if metadata_obj is not None:
+                _append_turbine_messages(metadata_obj, face_map_messages)
         _set_string_property(
             section_obj,
             "FaceMaterialMap",
-            json.dumps(face_material_metadata(section.regions)),
+            json.dumps(
+                face_material_metadata(
+                    face_ordered_regions,
+                    laminate_table=laminate_table,
+                    material_table=material_table,
+                )
+            ),
             group="Turbine",
             description="JSON map from face index to material metadata",
-        )
-        _set_string_property(
-            section_obj,
-            "LaminateDefinitions",
-            json.dumps(laminate_definitions(section.regions)),
-            group="Turbine",
-            description="JSON table of unique laminate ply stacks",
-        )
-        _set_string_property(
-            section_obj,
-            "MaterialDefinitions",
-            json.dumps(getattr(section, "material_definitions", None) or []),
-            group="Turbine",
-            description="JSON table of material properties from pyNuMAD",
         )
         _set_string_property(
             section_obj,
@@ -412,43 +522,200 @@ def make_freecad_section_part(section, *, doc=None, name=None, debug_faces=False
     return wire_obj
 
 
-def face_material_metadata(regions):
+def face_material_metadata(regions, *, laminate_table=None, material_table=None):
     """Return face-index/material metadata for serialized or object regions.
 
-    Laminate faces reference the table returned by
-    :func:`laminate_definitions` through ``assignment_name``.  The full ply
-    stack is intentionally stored once in that table rather than repeated for
-    each face.
+    Laminate faces reference a laminate table by ``assignment_index`` and
+    ``assignment_name``.  If no table is supplied, a section-local table is
+    built for diagnostic/backward-compatible calls.  FreeCAD export paths pass
+    turbine-level laminate and material tables so every station references the
+    same definitions.
     """
 
     metadata = []
-    laminate_table = laminate_definitions(regions)
+    laminate_table = laminate_table if laminate_table is not None else laminate_definitions(regions)
     laminate_index_by_key = {
         _laminate_key(item["plies"]): item["laminate_index"]
         for item in laminate_table
+    }
+    material_index_by_name = {
+        item["material_name"]: item.get("material_index")
+        for item in material_table or []
     }
     for index, region in enumerate(regions or []):
         region_name = _region_value(region, "name")
         plies = _region_value(region, "plies") or []
         laminate_index = laminate_index_by_key.get(_laminate_key(plies)) if plies else None
         assignment_type = "laminate" if laminate_index is not None else "material"
+        material_name = _region_value(region, "material_name")
+        assignment_index = (
+            laminate_index
+            if laminate_index is not None
+            else material_index_by_name.get(material_name)
+        )
         assignment_name = (
             laminate_table[laminate_index]["laminate_name"]
             if laminate_index is not None
-            else _region_value(region, "material_name")
+            else material_name
         )
         item = _parsed_region_name(region_name)
         item.update(
             dict(
                 face_index=index,
                 region_name=region_name,
-                material_name=_region_value(region, "material_name"),
+                material_name=material_name,
                 assignment_type=assignment_type,
+                assignment_index=assignment_index,
                 assignment_name=assignment_name,
             )
         )
         metadata.append(item)
     return metadata
+
+
+def _regions_in_shape_face_order(regions, source_faces, stitched_shape):
+    """Return regions reordered to match the actual FreeCAD ``Shape.Faces`` list."""
+
+    ordered_regions, _ = _regions_in_shape_face_order_with_messages(
+        regions,
+        source_faces,
+        stitched_shape,
+    )
+    return ordered_regions
+
+
+def _regions_in_shape_face_order_with_messages(regions, source_faces, stitched_shape, *, station=None):
+    """Return regions reordered to match the actual FreeCAD ``Shape.Faces`` list.
+
+    ``Part.makeCompound`` followed by ``sewShape`` can reorder faces.  The
+    material map is consumed through FreeCAD face indices, so match each sewn
+    face back to its source face using simple geometric signatures.  Failures
+    are returned as lightweight generation messages for ``TurbineMetadata``.
+    """
+
+    shape_faces = list(getattr(stitched_shape, "Faces", []) or [])
+    regions = list(regions or [])
+    source_faces = list(source_faces or [])
+    messages = []
+    if len(shape_faces) != len(regions) or len(source_faces) != len(regions):
+        messages.append(
+            _generation_message(
+                "error",
+                "face_count_mismatch",
+                (
+                    "FaceMaterialMap face-order verification failed because the generated region count, "
+                    "source face count, and stitched FreeCAD face count do not match. The map was written "
+                    "in region-generation order and may not match FreeCAD Face indices."
+                ),
+                station=station,
+                source="freecad_cross_sections.face_material_map",
+                region_count=len(regions),
+                source_face_count=len(source_faces),
+                stitched_face_count=len(shape_faces),
+            )
+        )
+        return regions, messages
+
+    source_signatures = [_face_signature(face) for face in source_faces]
+    shape_signatures = [_face_signature(face) for face in shape_faces]
+    if any(signature is None for signature in source_signatures + shape_signatures):
+        messages.append(
+            _generation_message(
+                "warning",
+                "face_signature_unavailable",
+                (
+                    "FaceMaterialMap face-order verification was skipped because at least one FreeCAD "
+                    "face did not expose area and center-of-mass data. The map was written in "
+                    "region-generation order and should be checked before assigning materials."
+                ),
+                station=station,
+                source="freecad_cross_sections.face_material_map",
+                region_count=len(regions),
+                source_face_count=len(source_faces),
+                stitched_face_count=len(shape_faces),
+            )
+        )
+        return regions, messages
+
+    unused = set(range(len(source_signatures)))
+    ordered = []
+    for shape_signature in shape_signatures:
+        best_index = min(
+            unused,
+            key=lambda index: _face_signature_distance(shape_signature, source_signatures[index]),
+        )
+        unused.remove(best_index)
+        ordered.append(regions[best_index])
+    return ordered, messages
+
+
+def _generation_message(severity, code, message, *, station=None, source=None, **details):
+    item = {
+        "severity": severity,
+        "code": code,
+        "message": message,
+    }
+    if station is not None:
+        item["station"] = station
+    if source is not None:
+        item["source"] = source
+    if details:
+        item["details"] = details
+    return item
+
+
+def _set_turbine_messages(metadata_obj, messages):
+    warnings = [message for message in messages if message.get("severity") == "warning"]
+    errors = [message for message in messages if message.get("severity") == "error"]
+    _set_string_property(
+        metadata_obj,
+        "WarningMessages",
+        json.dumps(warnings),
+        group="Turbine",
+        description="JSON warning messages from pyNuMAD FreeCAD section generation",
+    )
+    _set_string_property(
+        metadata_obj,
+        "ErrorMessages",
+        json.dumps(errors),
+        group="Turbine",
+        description="JSON error messages from pyNuMAD FreeCAD section generation",
+    )
+
+
+def _append_turbine_messages(metadata_obj, messages):
+    existing = _existing_turbine_messages(metadata_obj)
+    _set_turbine_messages(metadata_obj, existing + list(messages or []))
+
+
+def _existing_turbine_messages(metadata_obj):
+    existing = []
+    for property_name in ("WarningMessages", "ErrorMessages"):
+        try:
+            existing.extend(json.loads(getattr(metadata_obj, property_name, "[]") or "[]"))
+        except (TypeError, ValueError):
+            pass
+    return existing
+
+
+def _face_signature(face):
+    try:
+        center = getattr(face, "CenterOfMass")
+        return (
+            float(getattr(face, "Area")),
+            float(center.x),
+            float(center.y),
+            float(center.z),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _face_signature_distance(first, second):
+    area_scale = max(abs(first[0]), abs(second[0]), 1.0)
+    area_error = abs(first[0] - second[0]) / area_scale
+    center_error = sum((first[index] - second[index]) ** 2 for index in range(1, 4)) ** 0.5
+    return area_error + center_error
 
 
 def laminate_definitions(regions):
@@ -480,6 +747,62 @@ def laminate_definitions(regions):
     return definitions
 
 
+def global_laminate_definitions(
+    blade,
+    *,
+    geometry_scaling=1.0,
+    normalize_chord=False,
+):
+    """Return turbine-level laminate definitions across every blade station.
+
+    The global table is built from the full ``StackDatabase``, not from the
+    subset of stations requested for FreeCAD export.  This keeps HomoGen's
+    material model at turbine scope while station ``FaceMaterialMap`` entries
+    only carry compact table indices.  With chord-normalized geometry, ply
+    thickness is also normalized station-by-station, so physically identical
+    laminates can become distinct exported definitions.
+    """
+
+    definitions = []
+    index_by_key = {}
+
+    def add_plygroup(plygroup, station):
+        transformer = _StationTransformer(
+            blade,
+            station,
+            geometry_scaling=geometry_scaling,
+            normalize_chord=normalize_chord,
+            move_le_to_origin=False,
+        )
+        plies = _plies_from_plygroup(plygroup, transformer)
+        if not plies:
+            return
+        key = _laminate_key(plies)
+        if key in index_by_key:
+            return
+        laminate_index = len(definitions)
+        index_by_key[key] = laminate_index
+        definitions.append(
+            {
+                "laminate_index": laminate_index,
+                "laminate_name": f"Laminate{laminate_index:03d}",
+                "plies": plies,
+            }
+        )
+
+    stackdb = getattr(blade, "stackdb", None)
+    for stack_array_name in ("stacks", "swstacks"):
+        stack_array = getattr(stackdb, stack_array_name, None)
+        if stack_array is None:
+            continue
+        for station in range(stack_array.shape[1]):
+            for stack in stack_array[:, station]:
+                for plygroup in getattr(stack, "plygroups", []) or []:
+                    add_plygroup(plygroup, station)
+
+    return definitions
+
+
 def material_definitions(blade):
     """Return project-local material property definitions for HomoGen.
 
@@ -492,8 +815,9 @@ def material_definitions(blade):
     materials = getattr(getattr(blade, "definition", None), "materials", {}) or {}
     material_iter = materials.values() if isinstance(materials, dict) else materials
     definitions = []
-    for material in material_iter:
+    for material_index, material in enumerate(material_iter):
         item = {
+            "material_index": material_index,
             "material_name": material.name,
             "material_type": material.type,
             "density": _json_value(material.density),
@@ -514,6 +838,53 @@ def material_definitions(blade):
 
         definitions.append(item)
     return definitions
+
+
+def blade_station_count(blade):
+    """Return the number of imported blade stations."""
+
+    span = getattr(getattr(blade, "definition", None), "ispan", None)
+    return 0 if span is None else len(span)
+
+
+def yaml_station_count(yaml_path):
+    """Return the number of blade stations declared in a WindIO/pyNuMAD YAML.
+
+    This lightweight helper reads only the YAML station arrays, so HomoGen can
+    populate a station-range UI before constructing the full pyNuMAD blade
+    geometry.  ``outer_shape_bem.reference_axis.z.values`` is the preferred
+    source because it defines the spanwise station locations; common fallback
+    grids are checked for older or partial files.
+    """
+
+    data = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
+    try:
+        outer_shape = data["components"]["blade"]["outer_shape_bem"]
+    except (TypeError, KeyError) as exc:
+        raise ValueError("YAML file does not contain components.blade.outer_shape_bem station data") from exc
+
+    candidates = [
+        ("outer_shape_bem.reference_axis.z.values", outer_shape.get("reference_axis", {}).get("z", {}).get("values")),
+        ("outer_shape_bem.chord.values", outer_shape.get("chord", {}).get("values")),
+        ("outer_shape_bem.twist.values", outer_shape.get("twist", {}).get("values")),
+        ("outer_shape_bem.reference_axis.z.grid", outer_shape.get("reference_axis", {}).get("z", {}).get("grid")),
+        ("outer_shape_bem.chord.grid", outer_shape.get("chord", {}).get("grid")),
+    ]
+    for _label, values in candidates:
+        if values:
+            return len(values)
+    raise ValueError("YAML file does not define any recognized blade station arrays")
+
+
+def get_yaml_station_count(yaml_path):
+    """Lightweight public API for HomoGen station-range dialogs.
+
+    This is an explicit alias for :func:`yaml_station_count`, provided so UI
+    code can ask for the station count before importing/generating FreeCAD
+    cross-section geometry.
+    """
+
+    return yaml_station_count(yaml_path)
 
 
 def station_frame_definition(blade, station):
@@ -2998,6 +3369,62 @@ def _set_string_property(obj, name, value, group="", description=""):
     setattr(obj, name, value)
 
 
+def _get_or_create_turbine_metadata_object(doc):
+    metadata_obj = doc.getObject("TurbineMetadata") if hasattr(doc, "getObject") else None
+    if metadata_obj is None:
+        metadata_obj = doc.addObject("App::FeaturePython", "TurbineMetadata")
+        metadata_obj.Label = "Turbine Metadata"
+    return metadata_obj
+
+
+def _initialize_turbine_metadata_defaults(metadata_obj, *, station_count=0):
+    if "MaterialDefinitions" not in getattr(metadata_obj, "PropertiesList", []):
+        _set_string_property(
+            metadata_obj,
+            "MaterialDefinitions",
+            json.dumps([]),
+            group="Turbine",
+            description="JSON turbine-level material property table from pyNuMAD",
+        )
+    if "LaminateDefinitions" not in getattr(metadata_obj, "PropertiesList", []):
+        _set_string_property(
+            metadata_obj,
+            "LaminateDefinitions",
+            json.dumps([]),
+            group="Turbine",
+            description="JSON turbine-level laminate ply stack table",
+        )
+    if "StationCount" not in getattr(metadata_obj, "PropertiesList", []):
+        metadata_obj.addProperty("App::PropertyInteger", "StationCount", "Turbine", "Number of blade stations in the YAML")
+        metadata_obj.StationCount = int(station_count)
+    _set_turbine_messages(metadata_obj, _existing_turbine_messages(metadata_obj))
+
+
+def _make_turbine_metadata_object(doc, *, material_table, laminate_table, station_count):
+    """Create/update the document-level HomoGen metadata object."""
+
+    metadata_obj = _get_or_create_turbine_metadata_object(doc)
+    _set_string_property(
+        metadata_obj,
+        "MaterialDefinitions",
+        json.dumps(material_table),
+        group="Turbine",
+        description="JSON turbine-level material property table from pyNuMAD",
+    )
+    _set_string_property(
+        metadata_obj,
+        "LaminateDefinitions",
+        json.dumps(laminate_table),
+        group="Turbine",
+        description="JSON turbine-level laminate ply stack table",
+    )
+    if "StationCount" not in getattr(metadata_obj, "PropertiesList", []):
+        metadata_obj.addProperty("App::PropertyInteger", "StationCount", "Turbine", "Number of blade stations in the YAML")
+    metadata_obj.StationCount = int(station_count)
+    _set_turbine_messages(metadata_obj, [])
+    return metadata_obj
+
+
 def _set_view_color(obj, color):
     """Assign a view color when running in a FreeCAD GUI-capable context."""
 
@@ -3212,6 +3639,114 @@ def stitched_section_shape(faces):
     return shape
 
 
+def regions_in_shape_face_order(regions, source_faces, stitched_shape):
+    ordered_regions, messages = regions_in_shape_face_order_with_messages(regions, source_faces, stitched_shape)
+    return ordered_regions
+
+
+def regions_in_shape_face_order_with_messages(regions, source_faces, stitched_shape, station=None):
+    shape_faces = list(getattr(stitched_shape, "Faces", []) or [])
+    regions = list(regions or [])
+    source_faces = list(source_faces or [])
+    messages = []
+    if len(shape_faces) != len(regions) or len(source_faces) != len(regions):
+        messages.append(
+            generation_message(
+                "error",
+                "face_count_mismatch",
+                (
+                    "FaceMaterialMap face-order verification failed because the generated region count, "
+                    "source face count, and stitched FreeCAD face count do not match. The map was written "
+                    "in region-generation order and may not match FreeCAD Face indices."
+                ),
+                station=station,
+                source="freecad_cross_sections.face_material_map",
+                region_count=len(regions),
+                source_face_count=len(source_faces),
+                stitched_face_count=len(shape_faces),
+            )
+        )
+        return regions, messages
+
+    source_signatures = [face_signature(face) for face in source_faces]
+    shape_signatures = [face_signature(face) for face in shape_faces]
+    if any(signature is None for signature in source_signatures + shape_signatures):
+        messages.append(
+            generation_message(
+                "warning",
+                "face_signature_unavailable",
+                (
+                    "FaceMaterialMap face-order verification was skipped because at least one FreeCAD "
+                    "face did not expose area and center-of-mass data. The map was written in "
+                    "region-generation order and should be checked before assigning materials."
+                ),
+                station=station,
+                source="freecad_cross_sections.face_material_map",
+                region_count=len(regions),
+                source_face_count=len(source_faces),
+                stitched_face_count=len(shape_faces),
+            )
+        )
+        return regions, messages
+
+    unused = set(range(len(source_signatures)))
+    ordered = []
+    for shape_signature in shape_signatures:
+        best_index = min(
+            unused,
+            key=lambda index: face_signature_distance(shape_signature, source_signatures[index]),
+        )
+        unused.remove(best_index)
+        ordered.append(regions[best_index])
+    return ordered, messages
+
+
+def generation_message(severity, code, message, station=None, source=None, **details):
+    item = {{
+        "severity": severity,
+        "code": code,
+        "message": message,
+    }}
+    if station is not None:
+        item["station"] = station
+    if source is not None:
+        item["source"] = source
+    if details:
+        item["details"] = details
+    return item
+
+
+def set_turbine_messages(metadata_obj, messages):
+    warnings = [message for message in messages if message.get("severity") == "warning"]
+    errors = [message for message in messages if message.get("severity") == "error"]
+    if "WarningMessages" not in getattr(metadata_obj, "PropertiesList", []):
+        metadata_obj.addProperty("App::PropertyString", "WarningMessages", "Turbine", "JSON warning messages from pyNuMAD FreeCAD section generation")
+    metadata_obj.WarningMessages = json.dumps(warnings)
+    if "ErrorMessages" not in getattr(metadata_obj, "PropertiesList", []):
+        metadata_obj.addProperty("App::PropertyString", "ErrorMessages", "Turbine", "JSON error messages from pyNuMAD FreeCAD section generation")
+    metadata_obj.ErrorMessages = json.dumps(errors)
+
+
+def face_signature(face):
+    try:
+        center = getattr(face, "CenterOfMass")
+        return (
+            float(getattr(face, "Area")),
+            float(center.x),
+            float(center.y),
+            float(center.z),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def face_signature_distance(first, second):
+    area_scale = max(abs(first[0]), abs(second[0]), 1.0)
+    area_error = abs(first[0] - second[0]) / area_scale
+    center_error = sum((first[index] - second[index]) ** 2 for index in range(1, 4)) ** 0.5
+    return area_error + center_error
+
+
 def parsed_region_name(name):
     parts = name.split("_")
     parsed = dict(
@@ -3248,17 +3783,21 @@ def parsed_region_name(name):
     return parsed
 
 
-def face_metadata(regions):
+def face_metadata(regions, laminate_table, material_table):
     metadata = []
-    laminate_table = laminate_definitions(regions)
     laminate_index_by_key = {{
         laminate_key(item["plies"]): item["laminate_index"]
         for item in laminate_table
+    }}
+    material_index_by_name = {{
+        item["material_name"]: item.get("material_index")
+        for item in material_table
     }}
     for index, region in enumerate(regions):
         plies = region.get("plies", [])
         laminate_index = laminate_index_by_key.get(laminate_key(plies)) if plies else None
         assignment_type = "laminate" if laminate_index is not None else "material"
+        assignment_index = laminate_index if laminate_index is not None else material_index_by_name.get(region["material_name"])
         assignment_name = laminate_table[laminate_index]["laminate_name"] if laminate_index is not None else region["material_name"]
         item = parsed_region_name(region["name"])
         item.update(
@@ -3267,6 +3806,7 @@ def face_metadata(regions):
                 region_name=region["name"],
                 material_name=region["material_name"],
                 assignment_type=assignment_type,
+                assignment_index=assignment_index,
                 assignment_name=assignment_name,
             )
         )
@@ -3319,6 +3859,18 @@ def color_for_material(material_name):
 
 doc = App.newDocument(DATA["wt_name"] + "_cross_sections")
 created = []
+generation_messages = []
+
+if DATA["detailed"]:
+    metadata_obj = doc.addObject("App::FeaturePython", "TurbineMetadata")
+    metadata_obj.Label = "Turbine Metadata"
+    metadata_obj.addProperty("App::PropertyString", "MaterialDefinitions", "Turbine", "JSON turbine-level material property table from pyNuMAD")
+    metadata_obj.MaterialDefinitions = json.dumps(DATA["material_definitions"])
+    metadata_obj.addProperty("App::PropertyString", "LaminateDefinitions", "Turbine", "JSON turbine-level laminate ply stack table")
+    metadata_obj.LaminateDefinitions = json.dumps(DATA["laminate_definitions"])
+    metadata_obj.addProperty("App::PropertyInteger", "StationCount", "Turbine", "Number of blade stations in the YAML")
+    metadata_obj.StationCount = int(DATA["station_count"])
+    set_turbine_messages(metadata_obj, generation_messages)
 
 for section in DATA["sections"]:
     station = section["station"]
@@ -3340,12 +3892,10 @@ for section in DATA["sections"]:
         stitched_obj = doc.addObject("Part::Feature", "Station{{:03d}}_section".format(station))
         stitched_obj.Shape = stitched_section_shape(section_faces)
         stitched_obj.Label = "Station {{:03d}}".format(station)
+        face_ordered_regions, face_map_messages = regions_in_shape_face_order_with_messages(section["regions"], section_faces, stitched_obj.Shape, station=station)
+        generation_messages.extend(face_map_messages)
         stitched_obj.addProperty("App::PropertyString", "FaceMaterialMap", "Turbine", "JSON map from face index to material metadata")
-        stitched_obj.FaceMaterialMap = json.dumps(face_metadata(section["regions"]))
-        stitched_obj.addProperty("App::PropertyString", "LaminateDefinitions", "Turbine", "JSON table of unique laminate ply stacks")
-        stitched_obj.LaminateDefinitions = json.dumps(laminate_definitions(section["regions"]))
-        stitched_obj.addProperty("App::PropertyString", "MaterialDefinitions", "Turbine", "JSON table of material properties from pyNuMAD")
-        stitched_obj.MaterialDefinitions = json.dumps(DATA["material_definitions"])
+        stitched_obj.FaceMaterialMap = json.dumps(face_metadata(face_ordered_regions, DATA["laminate_definitions"], DATA["material_definitions"]))
         stitched_obj.addProperty("App::PropertyString", "StationFrame", "Turbine", "JSON station reference-axis origin, rotations, and local coordinate system")
         stitched_obj.StationFrame = json.dumps(section.get("station_frame", {{}}))
         if hasattr(stitched_obj, "ViewObject") and stitched_obj.ViewObject is not None:
@@ -3380,6 +3930,9 @@ for section in DATA["sections"]:
             face_obj = doc.addObject("Part::Feature", "Station{{:03d}}_face".format(station))
             face_obj.Shape = Part.Face(wire)
             created.append(face_obj)
+
+if DATA["detailed"]:
+    set_turbine_messages(metadata_obj, generation_messages)
 
 doc.recompute()
 
