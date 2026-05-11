@@ -1,3 +1,5 @@
+import json
+
 import pynumad
 import numpy as np
 
@@ -9,16 +11,18 @@ from pynumad.analysis.freecad import (
     get_yaml_station_count,
     global_laminate_definitions,
     laminate_definitions,
+    load_blade_for_freecad,
     material_definitions,
     make_freecad_cross_section_parts,
     make_freecad_section_part,
+    record_turbine_message,
     station_frame_definition,
     write_freecad_cross_sections,
     yaml_station_count,
 )
 from pynumad.analysis.freecad.make_cross_sections import (
     _regions_in_shape_face_order,
-    _regions_in_shape_face_order_with_diagnostics,
+    _regions_in_shape_face_order_with_messages,
 )
 
 
@@ -42,6 +46,30 @@ class _FakeShape:
 
 class _FakeFaceWithoutSignature:
     pass
+
+
+class _FakeFreeCADObject:
+    def __init__(self, name):
+        self.Name = name
+        self.Label = name
+        self.PropertiesList = []
+
+    def addProperty(self, _type_name, name, _group="", _description=""):
+        if name not in self.PropertiesList:
+            self.PropertiesList.append(name)
+
+
+class _FakeFreeCADDoc:
+    def __init__(self):
+        self.objects = {}
+
+    def getObject(self, name):
+        return self.objects.get(name)
+
+    def addObject(self, _type_name, name):
+        obj = _FakeFreeCADObject(name)
+        self.objects[name] = obj
+        return obj
 
 
 def test_get_cross_section_splits_hp_and_lp_surfaces():
@@ -74,7 +102,8 @@ def test_write_freecad_cross_sections_script(tmp_path):
     assert "Station{:03d}_wire" in contents
     assert '"station_frame"' in contents
     assert "StationFrame" in contents
-    assert "FaceMaterialMapDiagnostics" in contents
+    assert "WarningMessages" in contents
+    assert "ErrorMessages" in contents
 
 
 def test_get_detailed_cross_section_has_shell_and_web_regions():
@@ -305,7 +334,7 @@ def test_face_material_regions_can_follow_reordered_freecad_faces():
     assert ordered == ["skin_b", "skin_a", "core"]
 
 
-def test_face_material_reorder_reports_verified_diagnostics():
+def test_face_material_reorder_returns_no_messages_when_verified():
     regions = ["skin_a", "core", "skin_b"]
     source_faces = [
         _FakeFace(1.0, (0.0, 0.0)),
@@ -314,7 +343,7 @@ def test_face_material_reorder_reports_verified_diagnostics():
     ]
     stitched_shape = _FakeShape([source_faces[2], source_faces[0], source_faces[1]])
 
-    ordered, diagnostics = _regions_in_shape_face_order_with_diagnostics(
+    ordered, messages = _regions_in_shape_face_order_with_messages(
         regions,
         source_faces,
         stitched_shape,
@@ -322,13 +351,10 @@ def test_face_material_reorder_reports_verified_diagnostics():
     )
 
     assert ordered == ["skin_b", "skin_a", "core"]
-    assert diagnostics["station"] == 10
-    assert diagnostics["face_order_verified"] is True
-    assert diagnostics["warnings"] == []
-    assert diagnostics["errors"] == []
+    assert messages == []
 
 
-def test_face_material_reorder_warns_when_signatures_are_unavailable():
+def test_face_material_reorder_returns_warning_when_signatures_are_unavailable():
     regions = ["skin_a", "core", "skin_b"]
     source_faces = [
         _FakeFace(1.0, (0.0, 0.0)),
@@ -337,7 +363,7 @@ def test_face_material_reorder_warns_when_signatures_are_unavailable():
     ]
     stitched_shape = _FakeShape(source_faces)
 
-    ordered, diagnostics = _regions_in_shape_face_order_with_diagnostics(
+    ordered, messages = _regions_in_shape_face_order_with_messages(
         regions,
         source_faces,
         stitched_shape,
@@ -345,10 +371,46 @@ def test_face_material_reorder_warns_when_signatures_are_unavailable():
     )
 
     assert ordered == regions
-    assert diagnostics["face_order_verified"] is False
-    assert diagnostics["warnings"][0]["code"] == "face_signature_unavailable"
-    assert "region-generation order" in diagnostics["warnings"][0]["message"]
-    assert diagnostics["errors"] == []
+    assert len(messages) == 1
+    assert messages[0]["severity"] == "warning"
+    assert messages[0]["code"] == "face_signature_unavailable"
+    assert messages[0]["station"] == 10
+    assert messages[0]["source"] == "freecad_cross_sections.face_material_map"
+    assert "region-generation order" in messages[0]["message"]
+
+
+def test_record_turbine_message_creates_metadata_error_channel():
+    doc = _FakeFreeCADDoc()
+
+    metadata_obj = record_turbine_message(
+        doc,
+        "error",
+        "blade_yaml_read_failed",
+        "YAML web missing arcs",
+        source="freecad_cross_sections.blade_load",
+        details={"yaml_file": "examples/example_data/V27_fromScan.yaml"},
+    )
+
+    assert metadata_obj is doc.getObject("TurbineMetadata")
+    assert json.loads(metadata_obj.WarningMessages) == []
+    errors = json.loads(metadata_obj.ErrorMessages)
+    assert errors[0]["code"] == "blade_yaml_read_failed"
+    assert errors[0]["source"] == "freecad_cross_sections.blade_load"
+    assert errors[0]["details"]["yaml_file"] == "examples/example_data/V27_fromScan.yaml"
+    assert json.loads(metadata_obj.MaterialDefinitions) == []
+    assert json.loads(metadata_obj.LaminateDefinitions) == []
+
+
+def test_load_blade_for_freecad_records_yaml_load_failure():
+    doc = _FakeFreeCADDoc()
+
+    blade = load_blade_for_freecad("examples/example_data/V27_fromScan.yaml", doc=doc)
+
+    assert blade is None
+    errors = json.loads(doc.getObject("TurbineMetadata").ErrorMessages)
+    assert errors[0]["code"] == "blade_yaml_read_failed"
+    assert errors[0]["details"]["exception_type"] == "ValueError"
+    assert "start_nd_arc and end_nd_arc" in errors[0]["message"]
 
 
 def test_material_definitions_include_elastic_density_and_thermal_data():
