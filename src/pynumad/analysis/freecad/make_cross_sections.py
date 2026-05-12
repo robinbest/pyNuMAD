@@ -2248,13 +2248,16 @@ def _flatback_te_adhesive_regions(station, flatback_te, shell_regions, cs_params
     ]
 
 
-def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, tolerance=1e-8):
+def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, tolerance=1e-8, skipped_outer_tolerance=1e-3):
     """Collect a through-thickness connector at a trimmed shell end.
 
     Regions are sorted by layer index and chained from the supplied outer point
     toward the innermost layer.  Points that do not match within ``1e-8`` output
     units are skipped, which keeps unrelated or numerically disconnected layers
-    out of the adhesive boundary.
+    out of the adhesive boundary.  If a thin gelcoat face is intentionally
+    omitted, the first emitted shell layer begins just inward of ``outer_point``;
+    that small initial gap is accepted so TE adhesive still closes through the
+    skipped thickness.
     """
 
     candidates_by_layer = []
@@ -2276,8 +2279,12 @@ def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, t
     points = [outer_point]
     for _, region in candidates_by_layer:
         region_outer_point = region.outer_points[0] if connector_end == "start" else region.outer_points[-1]
-        if np.linalg.norm(region_outer_point - points[-1]) > tolerance:
-            continue
+        gap = np.linalg.norm(region_outer_point - points[-1])
+        if gap > tolerance:
+            if len(points) == 1 and gap <= skipped_outer_tolerance:
+                points.append(region_outer_point)
+            else:
+                continue
         connector = region.start_connector if connector_end == "start" else region.end_connector
         ordered = np.flip(connector, axis=0) if connector_end == "start" else connector
         if np.linalg.norm(ordered[0] - points[-1]) > tolerance:
