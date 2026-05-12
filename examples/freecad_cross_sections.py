@@ -24,6 +24,11 @@ def get_cs_params(blade):
         "adhesive_mat_name": "Adhesive",
         "web_fore_adhesive_thickness": adhesive_thickness,
         "web_aft_adhesive_thickness": adhesive_thickness,
+
+
+        # shell spar-boundary adhesive
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
     }
 
 

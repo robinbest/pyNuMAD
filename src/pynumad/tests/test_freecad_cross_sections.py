@@ -23,6 +23,7 @@ from pynumad.analysis.freecad import (
 from pynumad.analysis.freecad.make_cross_sections import (
     _regions_in_shape_face_order,
     _regions_in_shape_face_order_with_messages,
+    _shell_laminate_vertex_contact_messages,
 )
 
 
@@ -377,6 +378,124 @@ def test_face_material_reorder_returns_warning_when_signatures_are_unavailable()
     assert messages[0]["station"] == 10
     assert messages[0]["source"] == "freecad_cross_sections.face_material_map"
     assert "region-generation order" in messages[0]["message"]
+
+
+def test_shell_laminate_vertex_contact_warning_identifies_spar_cap_skin_step():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+
+    messages = _shell_laminate_vertex_contact_messages(section.regions)
+    target = next(
+        message
+        for message in messages
+        if message["details"]["first_region_name"] == "Station010_HP_03_10_HP_SPAR_layer02"
+        and message["details"]["second_region_name"] == "Station010_HP_02_10_HP_TE_PANEL_layer03"
+    )
+
+    assert target["severity"] == "warning"
+    assert target["code"] == "shell_laminate_vertex_contact"
+    assert target["station"] == 10
+    assert target["details"]["first_face_index"] == 22
+    assert target["details"]["second_face_index"] == 31
+    assert np.isclose(target["details"]["first_thickness"], 0.095)
+    assert np.isclose(target["details"]["second_thickness"], 0.003)
+
+
+def test_shell_component_adhesive_inserts_four_spar_boundary_faces():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    metadata = face_material_metadata(
+        section.regions,
+        laminate_table=global_laminate_definitions(blade),
+        material_table=material_definitions(blade),
+    )
+    shell_adhesives = [
+        item
+        for item in metadata
+        if "_to_" in item["region_name"] and item["material_name"] == "Adhesive"
+    ]
+
+    assert len(shell_adhesives) == 4
+    assert all("_adhesive_layer00" not in item["region_name"] for item in metadata)
+    assert all("_adhesive_layer01" not in item["region_name"] for item in metadata)
+    assert {item["layer"] for item in shell_adhesives} == {2}
+    assert all(item["material_name"] == "Adhesive" for item in shell_adhesives)
+    assert all(item["assignment_type"] == "material" for item in shell_adhesives)
+    assert all("SPAR" in item["region_name"] for item in shell_adhesives)
+    assert _shell_laminate_vertex_contact_messages(section.regions) == []
+
+
+def test_shell_component_adhesive_preserves_common_outer_layer_areas():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    baseline = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    with_adhesive = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    baseline_areas = {
+        region.name: _polygon_area(_region_polygon(region))
+        for region in baseline.regions
+        if ("_HP_" in region.name or "_LP_" in region.name)
+        and (region.name.endswith("_layer00") or region.name.endswith("_layer01"))
+    }
+
+    for region in with_adhesive.regions:
+        if "_to_" in region.name:
+            assert not region.name.endswith("_layer00")
+            assert not region.name.endswith("_layer01")
+            continue
+        if region.name in baseline_areas:
+            assert np.isclose(_polygon_area(_region_polygon(region)), baseline_areas[region.name])
+
+
+def test_shell_component_adhesive_keeps_spar_boundary_colinear():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    checks = [
+        (
+            "Station010_HP_03_10_HP_SPAR_layer01",
+            "start_connector",
+            "Station010_HP_02_10_HP_TE_PANEL_to_03_10_HP_SPAR_adhesive_layer02",
+            "end_connector",
+        ),
+        (
+            "Station010_HP_03_10_HP_SPAR_layer01",
+            "end_connector",
+            "Station010_HP_03_10_HP_SPAR_to_04_10_HP_LE_PANEL_adhesive_layer02",
+            "start_connector",
+        ),
+        (
+            "Station010_LP_08_10_LP_SPAR_layer01",
+            "start_connector",
+            "Station010_LP_07_10_LP_LE_PANEL_to_08_10_LP_SPAR_adhesive_layer02",
+            "end_connector",
+        ),
+        (
+            "Station010_LP_08_10_LP_SPAR_layer01",
+            "end_connector",
+            "Station010_LP_08_10_LP_SPAR_to_09_10_LP_TE_PANEL_adhesive_layer02",
+            "start_connector",
+        ),
+    ]
+
+    for spar_layer_name, spar_connector_name, adhesive_name, adhesive_connector_name in checks:
+        spar_layer = next(region for region in section.regions if region.name == spar_layer_name)
+        adhesive = next(region for region in section.regions if region.name == adhesive_name)
+        spar_connector = getattr(spar_layer, spar_connector_name)
+        adhesive_connector = getattr(adhesive, adhesive_connector_name)
+        assert _segments_colinear(spar_connector[0], spar_connector[-1], adhesive_connector[0], adhesive_connector[-1])
 
 
 def test_record_turbine_message_creates_metadata_error_channel():
@@ -1007,6 +1126,22 @@ def _region_polygon(region):
             region.start_connector[1:],
         )
     )
+
+
+def _polygon_area(points):
+    if not np.allclose(points[0], points[-1]):
+        points = np.vstack((points, points[0]))
+    return 0.5 * abs(
+        np.dot(points[:-1, 0], points[1:, 1]) - np.dot(points[1:, 0], points[:-1, 1])
+    )
+
+
+def _segments_colinear(first_start, first_end, second_start, second_end, tolerance=1e-9):
+    first = first_end[:2] - first_start[:2]
+    second = second_end[:2] - second_start[:2]
+    if np.linalg.norm(first) <= tolerance or np.linalg.norm(second) <= tolerance:
+        return False
+    return abs(np.cross(first, second)) / (np.linalg.norm(first) * np.linalg.norm(second)) <= tolerance
 
 
 def _segments_intersect(first_start, first_end, second_start, second_end):

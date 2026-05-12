@@ -34,6 +34,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from pynumad.objects.stack import Ply, Stack
+
 
 @dataclass
 class FreeCADCrossSection:
@@ -475,6 +477,7 @@ def make_freecad_section_part(
             section_obj.Shape,
             station=section.station,
         )
+        face_map_messages.extend(_shell_laminate_vertex_contact_messages(face_ordered_regions))
         if message_log is not None:
             message_log.extend(face_map_messages)
         elif face_map_messages:
@@ -662,6 +665,155 @@ def _generation_message(severity, code, message, *, station=None, source=None, *
     if details:
         item["details"] = details
     return item
+
+
+def _shell_laminate_vertex_contact_messages(regions, *, tolerance=1e-8, thickness_ratio=5.0):
+    messages = []
+    indexed_regions = list(enumerate(regions or []))
+    for first_pos, (first_index, first) in enumerate(indexed_regions):
+        first_thickness = _region_laminate_thickness(first)
+        if first_thickness is None:
+            continue
+        first_parsed = _parsed_region_name(_region_value(first, "name"))
+        if first_parsed.get("side") not in ("HP", "LP") or first_parsed.get("web_index") is not None:
+            continue
+        if "_to_" in _region_value(first, "name"):
+            continue
+        first_polygon = _region_boundary_points(first)
+        if first_polygon is None:
+            continue
+        for second_index, second in indexed_regions[first_pos + 1 :]:
+            second_thickness = _region_laminate_thickness(second)
+            if second_thickness is None:
+                continue
+            second_parsed = _parsed_region_name(_region_value(second, "name"))
+            if second_parsed.get("side") != first_parsed.get("side") or second_parsed.get("web_index") is not None:
+                continue
+            if "_to_" in _region_value(second, "name"):
+                continue
+            if "SPAR" not in _region_value(first, "name").upper() and "SPAR" not in _region_value(second, "name").upper():
+                continue
+            second_polygon = _region_boundary_points(second)
+            if second_polygon is None:
+                continue
+            common_vertices = _common_boundary_vertices(first_polygon, second_polygon, tolerance=tolerance)
+            if not common_vertices:
+                continue
+            if _regions_share_boundary_edge(first_polygon, second_polygon, tolerance=tolerance):
+                continue
+            if _shell_component_adhesive_covers_vertices(indexed_regions, common_vertices, tolerance=tolerance):
+                continue
+            thick = max(first_thickness, second_thickness)
+            thin = min(first_thickness, second_thickness)
+            if thin <= 0 or thick / thin < thickness_ratio:
+                continue
+            messages.append(
+                _generation_message(
+                    "warning",
+                    "shell_laminate_vertex_contact",
+                    (
+                        "Two shell laminate regions with a large thickness mismatch meet only at a vertex. "
+                        "This can create an unmeshable interface; consider adding an adhesive or transition "
+                        "region at this shell component boundary."
+                    ),
+                    station=first_parsed.get("station"),
+                    source="freecad_cross_sections.shell_interfaces",
+                    first_face_index=first_index,
+                    first_region_name=_region_value(first, "name"),
+                    first_material_name=_region_value(first, "material_name"),
+                    first_thickness=first_thickness,
+                    second_face_index=second_index,
+                    second_region_name=_region_value(second, "name"),
+                    second_material_name=_region_value(second, "material_name"),
+                    second_thickness=second_thickness,
+                    common_vertices=[point.tolist() for point in common_vertices],
+                )
+            )
+    return messages
+
+
+def _shell_component_adhesive_covers_vertices(indexed_regions, vertices, *, tolerance):
+    for _, region in indexed_regions:
+        name = _region_value(region, "name")
+        if "_to_" not in name or "adhesive" not in name.lower():
+            continue
+        polygon = _region_boundary_points(region)
+        if polygon is None:
+            continue
+        if any(
+            any(np.linalg.norm(vertex[:2] - point[:2]) <= tolerance for point in polygon)
+            for vertex in vertices
+        ):
+            return True
+    return False
+
+
+def _region_laminate_thickness(region):
+    plies = _region_value(region, "plies") or []
+    if not plies:
+        return None
+    return sum(float(ply.get("thickness", 0.0) or 0.0) for ply in plies)
+
+
+def _region_boundary_points(region):
+    edge_points = _region_value(region, "edge_points")
+    if edge_points is not None:
+        points = []
+        for edge in edge_points:
+            points.extend(np.asarray(edge, dtype=float))
+        return _clean_boundary_points(points)
+    outer_points = _region_value(region, "outer_points")
+    inner_points = _region_value(region, "inner_points")
+    if outer_points is None or inner_points is None:
+        return None
+    points = list(np.asarray(outer_points, dtype=float))
+    end_connector = _region_value(region, "end_connector")
+    if end_connector is not None:
+        points.extend(np.asarray(end_connector, dtype=float))
+    points.extend(np.flip(np.asarray(inner_points, dtype=float), axis=0))
+    start_connector = _region_value(region, "start_connector")
+    if start_connector is not None:
+        points.extend(np.asarray(start_connector, dtype=float))
+    return _clean_boundary_points(points)
+
+
+def _clean_boundary_points(points, tolerance=1e-12):
+    cleaned = []
+    for point in points:
+        point = np.asarray(point, dtype=float)
+        if cleaned and np.linalg.norm(point - cleaned[-1]) <= tolerance:
+            continue
+        cleaned.append(point)
+    if len(cleaned) > 1 and np.linalg.norm(cleaned[0] - cleaned[-1]) <= tolerance:
+        cleaned.pop()
+    return np.asarray(cleaned)
+
+
+def _common_boundary_vertices(first_points, second_points, *, tolerance):
+    common = []
+    for first in first_points:
+        if any(np.linalg.norm(first[:2] - second[:2]) <= tolerance for second in second_points):
+            if not any(np.linalg.norm(first[:2] - existing[:2]) <= tolerance for existing in common):
+                common.append(first)
+    return common
+
+
+def _regions_share_boundary_edge(first_points, second_points, *, tolerance):
+    for first_start, first_end in zip(first_points, np.roll(first_points, -1, axis=0)):
+        if np.linalg.norm(first_start[:2] - first_end[:2]) <= tolerance:
+            continue
+        for second_start, second_end in zip(second_points, np.roll(second_points, -1, axis=0)):
+            if np.linalg.norm(second_start[:2] - second_end[:2]) <= tolerance:
+                continue
+            if (
+                np.linalg.norm(first_start[:2] - second_end[:2]) <= tolerance
+                and np.linalg.norm(first_end[:2] - second_start[:2]) <= tolerance
+            ) or (
+                np.linalg.norm(first_start[:2] - second_start[:2]) <= tolerance
+                and np.linalg.norm(first_end[:2] - second_end[:2]) <= tolerance
+            ):
+                return True
+    return False
 
 
 def _set_turbine_messages(metadata_obj, messages):
@@ -1134,7 +1286,23 @@ def _shell_regions(blade, station, section, transformer, cs_params):
             cs_params,
             flatback_te,
         )
-    regions = _perimeter_shell_regions(stacks, sides, segments, station, section, transformer)
+    shell_component_adhesives = _shell_component_adhesive_specs(
+        stacks,
+        sides,
+        segments,
+        station,
+        transformer,
+        cs_params,
+    )
+    regions = _perimeter_shell_regions(
+        stacks,
+        sides,
+        segments,
+        station,
+        section,
+        transformer,
+        shell_component_adhesives=shell_component_adhesives,
+    )
     if flatback_te is None:
         regions.extend(_trailing_edge_adhesive_regions(station, trailing_edge, regions, cs_params))
     else:
@@ -1564,6 +1732,162 @@ def _trim_segments_from_end(stacks, sides, segments, distance):
     return kept_stacks, kept_sides, kept_segments, _join_connected_edges(removed_parts) if removed_parts else None
 
 
+def _shell_component_adhesive_specs(stacks, sides, segments, station, transformer, cs_params):
+    """Return optional adhesive shell inserts at spar/component boundaries."""
+
+    width = transformer.length_from_m(
+        _station_value(cs_params.get("shell_component_adhesive_width"), station, default=0.0)
+    )
+    if width <= 0:
+        return []
+
+    material_name = cs_params.get("shell_component_adhesive_mat_name", cs_params.get("adhesive_mat_name", "Adhesive"))
+    adhesive_specs = []
+    i_segment = 0
+    while i_segment < len(stacks):
+        stack = stacks[i_segment]
+        side = sides[i_segment]
+        segment = segments[i_segment]
+        if (
+            i_segment < len(stacks) - 1
+            and sides[i_segment + 1] == side
+            and _is_spar_component_boundary(stack, stacks[i_segment + 1])
+            and _polyline_lengths(segment)[-1] > 1e-9
+            and _polyline_lengths(segments[i_segment + 1])[-1] > 1e-9
+        ):
+            next_stack = stacks[i_segment + 1]
+            next_segment = segments[i_segment + 1]
+            common_layers = _common_outer_plygroups(stack, next_stack)
+            if common_layers and len(common_layers) < max(len(stack.plygroups), len(next_stack.plygroups)):
+                adhesive_specs.append(
+                    {
+                        "side": side,
+                        "first_stack_name": stack.name,
+                        "second_stack_name": next_stack.name,
+                        "insert_layer": len(common_layers),
+                        "width": width,
+                        "material_name": material_name,
+                    }
+                )
+        i_segment += 1
+
+    return adhesive_specs
+
+
+def _apply_shell_component_adhesives_for_layer(stacks, sides, current_segments, i_layer, adhesive_specs):
+    """Insert shell adhesive segments at the current laminate depth."""
+
+    new_stacks = []
+    new_sides = []
+    new_segments = []
+    i_segment = 0
+    while i_segment < len(stacks):
+        stack = stacks[i_segment]
+        side = sides[i_segment]
+        segment = current_segments[i_segment]
+        spec = None
+        if i_segment < len(stacks) - 1:
+            next_stack = stacks[i_segment + 1]
+            for candidate in adhesive_specs:
+                if (
+                    candidate["insert_layer"] == i_layer
+                    and candidate["side"] == side
+                    and candidate["first_stack_name"] == stack.name
+                    and candidate["second_stack_name"] == next_stack.name
+                    and sides[i_segment + 1] == side
+                ):
+                    spec = candidate
+                    break
+
+        if spec is not None:
+            next_stack = stacks[i_segment + 1]
+            next_segment = current_segments[i_segment + 1]
+            left_length = _polyline_lengths(segment)[-1]
+            right_length = _polyline_lengths(next_segment)[-1]
+            stack_is_spar = "SPAR" in stack.name.upper()
+            next_stack_is_spar = "SPAR" in next_stack.name.upper()
+            left_trim = min(spec["width"], 0.45 * left_length) if next_stack_is_spar else 0.0
+            right_trim = min(spec["width"], 0.45 * right_length) if stack_is_spar else 0.0
+            if left_trim > 1e-9 or right_trim > 1e-9:
+                kept_left = _polyline_between(segment, 0.0, left_length - left_trim)
+                kept_right = _polyline_between(next_segment, right_trim, right_length)
+                if next_stack_is_spar:
+                    adhesive_segment = _clean_polyline(np.vstack((kept_left[-1], segment[-1])))
+                else:
+                    adhesive_segment = _clean_polyline(np.vstack((segment[-1], kept_right[0])))
+                new_stacks.append(stack)
+                new_sides.append(side)
+                new_segments.append(kept_left)
+                new_stacks.append(_shell_component_adhesive_stack(stack, next_stack, spec["material_name"]))
+                new_sides.append(side)
+                new_segments.append(adhesive_segment)
+                current_segments[i_segment + 1] = kept_right
+                i_segment += 1
+                continue
+
+        new_stacks.append(stack)
+        new_sides.append(side)
+        new_segments.append(segment)
+        i_segment += 1
+
+    return new_stacks, new_sides, new_segments
+
+
+def _is_spar_component_boundary(first_stack, second_stack):
+    first_is_spar = "SPAR" in first_stack.name.upper()
+    second_is_spar = "SPAR" in second_stack.name.upper()
+    return first_is_spar != second_is_spar
+
+
+def _shell_component_adhesive_stack(first_stack, second_stack, material_name):
+    stack = Stack()
+    stack.name = f"{first_stack.name}_to_{second_stack.name}_adhesive"
+    common_layers = _common_outer_plygroups(first_stack, second_stack)
+    first_remaining = sum(first_stack.layer_thicknesses()[len(common_layers) :])
+    second_remaining = sum(second_stack.layer_thicknesses()[len(common_layers) :])
+    stack.plygroups = common_layers + [
+        Ply(
+            component=stack.name,
+            materialid=material_name,
+            thickness=max(first_remaining, second_remaining),
+            angle=0.0,
+            nPlies=1,
+        )
+    ]
+    return stack
+
+
+def _common_outer_plygroups(first_stack, second_stack, tolerance=1e-12):
+    common = []
+    for first, second in zip(first_stack.plygroups, second_stack.plygroups):
+        first_thickness = first.nPlies * first.thickness
+        second_thickness = second.nPlies * second.thickness
+        if (
+            first.materialid != second.materialid
+            or abs(first_thickness - second_thickness) > tolerance
+            or abs(float(first.angle or 0.0) - float(second.angle or 0.0)) > tolerance
+        ):
+            break
+        common.append(
+            Ply(
+                component=_shell_component_bridge_marker(first_stack, second_stack),
+                materialid=first.materialid,
+                thickness=first.thickness,
+                angle=first.angle,
+                nPlies=first.nPlies,
+            )
+        )
+    return common
+
+
+def _shell_component_bridge_marker(first_stack, second_stack):
+    return f"{first_stack.name}_to_{second_stack.name}_bridge"
+
+
+def _is_shell_component_bridge_plygroup(plygroup):
+    return str(getattr(plygroup, "component", "")).endswith("_bridge")
+
+
 def _point_at_path_distance(segments, distance):
     """Return a point at arc length ``distance`` across connected segments."""
 
@@ -1663,7 +1987,15 @@ def _shell_regions_from_stack(stack, station, side, outer_points, section, trans
     ]
 
 
-def _perimeter_shell_regions(stacks, sides, segments, station, section, transformer):
+def _perimeter_shell_regions(
+    stacks,
+    sides,
+    segments,
+    station,
+    section,
+    transformer,
+    shell_component_adhesives=None,
+):
     """Expand perimeter stack segments into layer-by-layer shell face regions.
 
     For each ply layer, all current outer segments are combined into one path so
@@ -1673,15 +2005,31 @@ def _perimeter_shell_regions(stacks, sides, segments, station, section, transfor
     to mesh and do not contain sliver-like diagonal closures.
     """
 
+    shell_component_adhesives = shell_component_adhesives or []
     current_segments = [_clean_polyline(segment) for segment in segments]
     stack_name_counts = {
         (side, stack.name): sum(1 for other_side, other_stack in zip(sides, stacks) if other_side == side and other_stack.name == stack.name)
         for side, stack in zip(sides, stacks)
     }
     max_layers = max((len(stack.plygroups) for stack in stacks), default=0)
+    max_layers = max(max_layers, max((spec["insert_layer"] + 1 for spec in shell_component_adhesives), default=0))
     regions = []
 
     for i_layer in range(max_layers):
+        if any(spec["insert_layer"] == i_layer for spec in shell_component_adhesives):
+            stacks, sides, current_segments = _apply_shell_component_adhesives_for_layer(
+                stacks,
+                sides,
+                current_segments,
+                i_layer,
+                shell_component_adhesives,
+            )
+            stack_name_counts = {
+                (side, stack.name): sum(1 for other_side, other_stack in zip(sides, stacks) if other_side == side and other_stack.name == stack.name)
+                for side, stack in zip(sides, stacks)
+            }
+            max_layers = max(max_layers, max((len(stack.plygroups) for stack in stacks), default=0))
+
         combined_outer, segment_slices = _combine_connected_segments(current_segments)
         thicknesses = [
             transformer.length_from_mm(stack.plygroups[i_layer].nPlies * stack.plygroups[i_layer].thickness)
@@ -1746,24 +2094,25 @@ def _perimeter_shell_regions(stacks, sides, segments, station, section, transfor
                 inner_segment[-1],
                 _is_closed_polyline(combined_outer),
             )
-            regions.append(
-                FreeCADFaceRegion(
-                    name=f"Station{station:03d}_{sides[i_segment]}_{_shell_region_stack_name(stack, sides, stack_name_counts, i_segment)}_layer{i_layer:02d}",
-                    material_name=plygroup.materialid,
-                    ply_angle=plygroup.angle,
-                    laminate_name=_laminate_name(
-                        station,
-                        sides[i_segment],
-                        _shell_region_stack_name(stack, sides, stack_name_counts, i_segment),
-                        i_layer,
-                    ),
-                    plies=_plies_from_plygroup(plygroup, transformer),
-                    outer_points=outer_segment,
-                    inner_points=inner_segment,
-                    start_connector=start_connector,
-                    end_connector=end_connector,
+            if not _is_shell_component_bridge_plygroup(plygroup):
+                regions.append(
+                    FreeCADFaceRegion(
+                        name=f"Station{station:03d}_{sides[i_segment]}_{_shell_region_stack_name(stack, sides, stack_name_counts, i_segment)}_layer{i_layer:02d}",
+                        material_name=plygroup.materialid,
+                        ply_angle=plygroup.angle,
+                        laminate_name=_laminate_name(
+                            station,
+                            sides[i_segment],
+                            _shell_region_stack_name(stack, sides, stack_name_counts, i_segment),
+                            i_layer,
+                        ),
+                        plies=_plies_from_plygroup(plygroup, transformer),
+                        outer_points=outer_segment,
+                        inner_points=inner_segment,
+                        start_connector=start_connector,
+                        end_connector=end_connector,
+                    )
                 )
-            )
             current_segments[i_segment] = inner_segment
 
     return regions
@@ -3716,6 +4065,155 @@ def generation_message(severity, code, message, station=None, source=None, **det
     return item
 
 
+def shell_laminate_vertex_contact_messages(regions, tolerance=1e-8, thickness_ratio=5.0):
+    messages = []
+    indexed_regions = list(enumerate(regions or []))
+    for first_pos, (first_index, first) in enumerate(indexed_regions):
+        first_thickness = region_laminate_thickness(first)
+        if first_thickness is None:
+            continue
+        first_parsed = parsed_region_name(first["name"])
+        if first_parsed.get("side") not in ("HP", "LP") or first_parsed.get("web_index") is not None:
+            continue
+        if "_to_" in first["name"]:
+            continue
+        first_polygon = region_boundary_points(first)
+        if first_polygon is None:
+            continue
+        for second_index, second in indexed_regions[first_pos + 1:]:
+            second_thickness = region_laminate_thickness(second)
+            if second_thickness is None:
+                continue
+            second_parsed = parsed_region_name(second["name"])
+            if second_parsed.get("side") != first_parsed.get("side") or second_parsed.get("web_index") is not None:
+                continue
+            if "_to_" in second["name"]:
+                continue
+            if "SPAR" not in first["name"].upper() and "SPAR" not in second["name"].upper():
+                continue
+            second_polygon = region_boundary_points(second)
+            if second_polygon is None:
+                continue
+            common_vertices = common_boundary_vertices(first_polygon, second_polygon, tolerance)
+            if not common_vertices:
+                continue
+            if regions_share_boundary_edge(first_polygon, second_polygon, tolerance):
+                continue
+            if shell_component_adhesive_covers_vertices(indexed_regions, common_vertices, tolerance):
+                continue
+            thick = max(first_thickness, second_thickness)
+            thin = min(first_thickness, second_thickness)
+            if thin <= 0 or thick / thin < thickness_ratio:
+                continue
+            messages.append(
+                generation_message(
+                    "warning",
+                    "shell_laminate_vertex_contact",
+                    (
+                        "Two shell laminate regions with a large thickness mismatch meet only at a vertex. "
+                        "This can create an unmeshable interface; consider adding an adhesive or transition "
+                        "region at this shell component boundary."
+                    ),
+                    station=first_parsed.get("station"),
+                    source="freecad_cross_sections.shell_interfaces",
+                    first_face_index=first_index,
+                    first_region_name=first["name"],
+                    first_material_name=first["material_name"],
+                    first_thickness=first_thickness,
+                    second_face_index=second_index,
+                    second_region_name=second["name"],
+                    second_material_name=second["material_name"],
+                    second_thickness=second_thickness,
+                    common_vertices=common_vertices,
+                )
+            )
+    return messages
+
+
+def shell_component_adhesive_covers_vertices(indexed_regions, vertices, tolerance):
+    for _, region in indexed_regions:
+        name = region["name"]
+        if "_to_" not in name or "adhesive" not in name.lower():
+            continue
+        polygon = region_boundary_points(region)
+        if polygon is None:
+            continue
+        if any(any(point_distance_2d(vertex, point) <= tolerance for point in polygon) for vertex in vertices):
+            return True
+    return False
+
+
+def region_laminate_thickness(region):
+    plies = region.get("plies") or []
+    if not plies:
+        return None
+    return sum(float(ply.get("thickness", 0.0) or 0.0) for ply in plies)
+
+
+def region_boundary_points(region):
+    if region.get("edge_points") is not None:
+        points = []
+        for edge in region["edge_points"]:
+            points.extend(edge)
+        return clean_boundary_points(points)
+    if region.get("outer_points") is None or region.get("inner_points") is None:
+        return None
+    points = list(region["outer_points"])
+    if region.get("end_connector") is not None:
+        points.extend(region["end_connector"])
+    points.extend(list(reversed(region["inner_points"])))
+    if region.get("start_connector") is not None:
+        points.extend(region["start_connector"])
+    return clean_boundary_points(points)
+
+
+def clean_boundary_points(points, tolerance=1e-12):
+    cleaned = []
+    for point in points:
+        point = [float(point[0]), float(point[1]), float(point[2])]
+        if cleaned and point_distance(point, cleaned[-1]) <= tolerance:
+            continue
+        cleaned.append(point)
+    if len(cleaned) > 1 and point_distance(cleaned[0], cleaned[-1]) <= tolerance:
+        cleaned.pop()
+    return cleaned
+
+
+def point_distance(first, second):
+    return ((first[0] - second[0]) ** 2 + (first[1] - second[1]) ** 2 + (first[2] - second[2]) ** 2) ** 0.5
+
+
+def point_distance_2d(first, second):
+    return ((first[0] - second[0]) ** 2 + (first[1] - second[1]) ** 2) ** 0.5
+
+
+def common_boundary_vertices(first_points, second_points, tolerance):
+    common = []
+    for first in first_points:
+        if any(point_distance_2d(first, second) <= tolerance for second in second_points):
+            if not any(point_distance_2d(first, existing) <= tolerance for existing in common):
+                common.append(first)
+    return common
+
+
+def regions_share_boundary_edge(first_points, second_points, tolerance):
+    for first_start, first_end in zip(first_points, first_points[1:] + first_points[:1]):
+        if point_distance_2d(first_start, first_end) <= tolerance:
+            continue
+        for second_start, second_end in zip(second_points, second_points[1:] + second_points[:1]):
+            if point_distance_2d(second_start, second_end) <= tolerance:
+                continue
+            if (
+                point_distance_2d(first_start, second_end) <= tolerance
+                and point_distance_2d(first_end, second_start) <= tolerance
+            ) or (
+                point_distance_2d(first_start, second_start) <= tolerance
+                and point_distance_2d(first_end, second_end) <= tolerance
+            ):
+                return True
+    return False
+
+
 def set_turbine_messages(metadata_obj, messages):
     warnings = [message for message in messages if message.get("severity") == "warning"]
     errors = [message for message in messages if message.get("severity") == "error"]
@@ -3893,6 +4391,7 @@ for section in DATA["sections"]:
         stitched_obj.Shape = stitched_section_shape(section_faces)
         stitched_obj.Label = "Station {{:03d}}".format(station)
         face_ordered_regions, face_map_messages = regions_in_shape_face_order_with_messages(section["regions"], section_faces, stitched_obj.Shape, station=station)
+        face_map_messages.extend(shell_laminate_vertex_contact_messages(face_ordered_regions))
         generation_messages.extend(face_map_messages)
         stitched_obj.addProperty("App::PropertyString", "FaceMaterialMap", "Turbine", "JSON map from face index to material metadata")
         stitched_obj.FaceMaterialMap = json.dumps(face_metadata(face_ordered_regions, DATA["laminate_definitions"], DATA["material_definitions"]))
