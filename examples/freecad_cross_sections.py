@@ -29,6 +29,10 @@ def get_cs_params(blade):
         # shell spar-boundary adhesive
         "shell_component_adhesive_width": 0.001,
         "shell_component_adhesive_mat_name": "Adhesive",
+
+        # Skip shell layer00 only when it is gelcoat/coating. The gelcoat is a
+        # thin protective coating and can be too small for downstream meshing.
+        "skip_shell_gelcoat_layer": True,
     }
 
 

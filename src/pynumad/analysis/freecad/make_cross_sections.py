@@ -1302,6 +1302,7 @@ def _shell_regions(blade, station, section, transformer, cs_params):
         section,
         transformer,
         shell_component_adhesives=shell_component_adhesives,
+        skip_gelcoat_layer=bool(cs_params.get("skip_shell_gelcoat_layer", False)),
     )
     if flatback_te is None:
         regions.extend(_trailing_edge_adhesive_regions(station, trailing_edge, regions, cs_params))
@@ -1995,6 +1996,7 @@ def _perimeter_shell_regions(
     section,
     transformer,
     shell_component_adhesives=None,
+    skip_gelcoat_layer=False,
 ):
     """Expand perimeter stack segments into layer-by-layer shell face regions.
 
@@ -2094,7 +2096,10 @@ def _perimeter_shell_regions(
                 inner_segment[-1],
                 _is_closed_polyline(combined_outer),
             )
-            if not _is_shell_component_bridge_plygroup(plygroup):
+            if (
+                not _is_shell_component_bridge_plygroup(plygroup)
+                and not _skip_shell_plygroup_face(plygroup, i_layer, skip_gelcoat_layer)
+            ):
                 regions.append(
                     FreeCADFaceRegion(
                         name=f"Station{station:03d}_{sides[i_segment]}_{_shell_region_stack_name(stack, sides, stack_name_counts, i_segment)}_layer{i_layer:02d}",
@@ -2116,6 +2121,26 @@ def _perimeter_shell_regions(
             current_segments[i_segment] = inner_segment
 
     return regions
+
+
+def _skip_shell_plygroup_face(plygroup, i_layer, skip_gelcoat_layer):
+    """Return whether a shell plygroup should be offset but not emitted."""
+
+    return skip_gelcoat_layer and i_layer == 0 and _is_gelcoat_plygroup(plygroup)
+
+
+def _is_gelcoat_plygroup(plygroup):
+    """Return whether a plygroup looks like a gelcoat/coating layer."""
+
+    text = " ".join(
+        str(value).lower()
+        for value in (
+            getattr(plygroup, "materialid", ""),
+            getattr(plygroup, "component", ""),
+            getattr(plygroup, "name", ""),
+        )
+    )
+    return any(marker in text for marker in ("gelcoat", "gel coat", "coating", "coat"))
 
 
 def _shell_region_stack_name(stack, sides, stack_name_counts, i_segment):

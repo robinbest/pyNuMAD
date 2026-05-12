@@ -498,6 +498,41 @@ def test_shell_component_adhesive_keeps_spar_boundary_colinear():
         assert _segments_colinear(spar_connector[0], spar_connector[-1], adhesive_connector[0], adhesive_connector[-1])
 
 
+def test_skip_shell_gelcoat_layer_omits_layer00_but_preserves_inner_geometry():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    baseline = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    skipped = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"skip_shell_gelcoat_layer": True},
+    )
+
+    assert not any(
+        ("_HP_" in region.name or "_LP_" in region.name) and region.name.endswith("_layer00")
+        for region in skipped.regions
+    )
+    baseline_layer01 = next(region for region in baseline.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    skipped_layer01 = next(region for region in skipped.regions if region.name == baseline_layer01.name)
+    assert np.allclose(skipped_layer01.outer_points, baseline_layer01.outer_points)
+    assert np.allclose(skipped_layer01.inner_points, baseline_layer01.inner_points)
+
+
+def test_skip_shell_gelcoat_layer_keeps_non_gelcoat_layer00():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    blade.stackdb.stacks[1, 10].plygroups[0].materialid = "glass_triax"
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"skip_shell_gelcoat_layer": True},
+    )
+
+    assert any(region.name == "Station010_HP_01_10_HP_TE_REINF_layer00" for region in section.regions)
+
+
 def test_record_turbine_message_creates_metadata_error_channel():
     doc = _FakeFreeCADDoc()
 
