@@ -25,10 +25,16 @@ def get_cs_params(blade):
         "web_fore_adhesive_thickness": adhesive_thickness,
         "web_aft_adhesive_thickness": adhesive_thickness,
 
-
-        # shell spar-boundary adhesive
+        # Shell spar-boundary adhesive
         "shell_component_adhesive_width": 0.001,
         "shell_component_adhesive_mat_name": "Adhesive",
+
+        # Smooth/resample shell curves before layer offsets.
+        "shell_resample_enabled": True,
+        "shell_resample_scope": "side",
+        "shell_resample_spacing": 0.005,
+        "shell_resample_min_points": 12,
+        "shell_resample_max_points": 400,
     }
 
 

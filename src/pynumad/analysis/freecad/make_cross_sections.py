@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from scipy.interpolate import CubicSpline
 import yaml
 
 from pynumad.objects.stack import Ply, Stack
@@ -1262,7 +1263,7 @@ def _shell_regions(blade, station, section, transformer, cs_params):
     if stackdb.stacks is None:
         return []
 
-    hp_segments, lp_segments = _shell_segments(blade, station, section, transformer)
+    hp_segments, lp_segments = _shell_segments(blade, station, section, transformer, cs_params)
     stack_station = min(station, stackdb.stacks.shape[1] - 1)
 
     stacks, sides, segments = _remove_zero_length_shell_segments(
@@ -1412,7 +1413,7 @@ def _clamp_trailing_points_to_le_x(points, le_x, le_is_x_maximum, tolerance, max
         points[i_point, 0] = le_x
 
 
-def _shell_segments(blade, station, section, transformer):
+def _shell_segments(blade, station, section, transformer, cs_params=None):
     """Split HP and LP airfoil curves into stack segments using keypoints.
 
     HP segments are ordered from trailing edge to leading edge.  LP segments are
@@ -1424,8 +1425,12 @@ def _shell_segments(blade, station, section, transformer):
     hp_boundaries = np.vstack((section.hp_points[0], keypoints[0:5], section.hp_points[-1]))
     lp_boundaries = np.vstack((section.lp_points[-1], keypoints[5:10], section.lp_points[0]))
 
-    hp_segments = _split_polyline_at_points(section.hp_points, hp_boundaries)
-    lp_segments = _split_polyline_at_points(np.flip(section.lp_points, axis=0), lp_boundaries)
+    hp_curve = _resample_shell_side_curve(section.hp_points, station, transformer, cs_params)
+    lp_curve = _resample_shell_side_curve(np.flip(section.lp_points, axis=0), station, transformer, cs_params)
+    hp_segments = _split_polyline_at_points(hp_curve, hp_boundaries)
+    lp_segments = _split_polyline_at_points(lp_curve, lp_boundaries)
+    hp_segments = _resample_shell_segments(hp_segments, station, transformer, cs_params)
+    lp_segments = _resample_shell_segments(lp_segments, station, transformer, cs_params)
     return hp_segments, lp_segments
 
 
@@ -1445,6 +1450,90 @@ def _remove_zero_length_shell_segments(stacks, sides, segments):
         return [], [], []
     filtered_stacks, filtered_sides, filtered_segments = zip(*filtered)
     return list(filtered_stacks), list(filtered_sides), list(filtered_segments)
+
+
+def _resample_shell_segments(segments, station, transformer, cs_params):
+    """Optionally fit each shell segment to a spline and resample it."""
+
+    if not cs_params or not bool(cs_params.get("shell_resample_enabled", False)):
+        return segments
+    if _shell_resample_scope(cs_params) == "side":
+        return segments
+
+    spacing_m = _station_value(cs_params.get("shell_resample_spacing"), station, default=0.01)
+    spacing = transformer.length_from_m(spacing_m)
+    if spacing <= 0:
+        return segments
+
+    min_points = max(2, int(cs_params.get("shell_resample_min_points", 12)))
+    max_points = max(min_points, int(cs_params.get("shell_resample_max_points", 300)))
+    return [
+        _resample_curve_by_spline(segment, spacing, min_points=min_points, max_points=max_points)
+        for segment in segments
+    ]
+
+
+def _resample_shell_side_curve(points, station, transformer, cs_params):
+    """Optionally smooth/resample a full HP or LP curve before stack splitting."""
+
+    if (
+        not cs_params
+        or not bool(cs_params.get("shell_resample_enabled", False))
+        or _shell_resample_scope(cs_params) != "side"
+    ):
+        return points
+
+    spacing_m = _station_value(cs_params.get("shell_resample_spacing"), station, default=0.01)
+    spacing = transformer.length_from_m(spacing_m)
+    if spacing <= 0:
+        return points
+
+    min_points = max(2, int(cs_params.get("shell_resample_min_points", 12)))
+    max_points = max(min_points, int(cs_params.get("shell_resample_max_points", 300)))
+    return _resample_curve_by_spline(points, spacing, min_points=min_points, max_points=max_points)
+
+
+def _shell_resample_scope(cs_params):
+    """Return whether shell resampling is applied by side or by split segment."""
+
+    scope = str(cs_params.get("shell_resample_scope", "segment")).lower()
+    if scope in ("side", "airfoil", "surface"):
+        return "side"
+    return "segment"
+
+
+def _resample_curve_by_spline(points, spacing, *, min_points=12, max_points=300):
+    """Interpolate a curve by arc length and return uniformly sampled points.
+
+    Endpoints are preserved exactly because they carry stack/keypoint boundary
+    meaning downstream.
+    """
+
+    points = _clean_polyline(np.asarray(points, dtype=float), min_distance=1e-12)
+    length = _polyline_lengths(points)[-1]
+    if len(points) < 2 or length <= 1e-12:
+        return points
+
+    n_points = int(np.ceil(length / spacing)) + 1
+    n_points = min(max(n_points, min_points), max_points)
+    if n_points <= len(points):
+        return points
+
+    distances = _polyline_lengths(points)
+    sample_distances = np.linspace(0.0, length, n_points)
+    resampled = np.empty((n_points, points.shape[1]))
+
+    if len(points) < 3:
+        for i_dim in range(points.shape[1]):
+            resampled[:, i_dim] = np.interp(sample_distances, distances, points[:, i_dim])
+    else:
+        for i_dim in range(points.shape[1]):
+            spline = CubicSpline(distances, points[:, i_dim], bc_type="natural")
+            resampled[:, i_dim] = spline(sample_distances)
+
+    resampled[0] = points[0]
+    resampled[-1] = points[-1]
+    return resampled
 
 
 def _trim_trailing_edge_segments(stacks, sides, segments, station, transformer, cs_params):
@@ -3584,14 +3673,29 @@ def _freecad_vector(point, App):
     return App.Vector(float(point[0]), float(point[1]), float(point[2]))
 
 
-def _freecad_bspline_edge(points, App, Part):
+def _freecad_bspline_edge(points, App, Part, endpoint_tangents=False):
     """Create a FreeCAD edge from points, using a line for two-point edges."""
 
     if len(points) == 2:
         return Part.LineSegment(_freecad_vector(points[0], App), _freecad_vector(points[1], App)).toShape()
     curve = Part.BSplineCurve()
-    curve.interpolate([_freecad_vector(point, App) for point in points])
+    vectors = [_freecad_vector(point, App) for point in points]
+    if endpoint_tangents:
+        curve.interpolate(
+            vectors,
+            InitialTangent=_freecad_tangent(points, "start", App),
+            FinalTangent=_freecad_tangent(points, "end", App),
+        )
+    else:
+        curve.interpolate(vectors)
     return curve.toShape()
+
+
+def _freecad_tangent(points, end, App):
+    """Return an endpoint tangent vector for FreeCAD spline interpolation."""
+
+    tangent = _segment_end_tangent(np.asarray(points, dtype=float), end)
+    return App.Vector(float(tangent[0]), float(tangent[1]), float(tangent[2]))
 
 
 def _freecad_line_edges(points, App, Part):
@@ -3621,7 +3725,7 @@ def _freecad_face_between_curves(outer_points, inner_points, App, Part, start_co
     surface failures, fall back to a closed wire face.
     """
 
-    outer_edge = _freecad_bspline_edge(outer_points, App, Part)
+    outer_edge = _freecad_bspline_edge(outer_points, App, Part, endpoint_tangents=True)
     if start_connector is None:
         start_connector = [inner_points[0], outer_points[0]]
     if end_connector is None:
@@ -3630,13 +3734,13 @@ def _freecad_face_between_curves(outer_points, inner_points, App, Part, start_co
         # FreeCAD can occasionally fill long, thin spline wires with a spurious
         # rectangular face; a ruled surface keeps these strip regions bounded by
         # the intended inner and outer curves.
-        inner_edge = _freecad_bspline_edge(inner_points, App, Part)
+        inner_edge = _freecad_bspline_edge(inner_points, App, Part, endpoint_tangents=True)
         try:
             return Part.makeRuledSurface(outer_edge, inner_edge)
         except Exception:
             pass
 
-    inner_edge = _freecad_bspline_edge(list(reversed(inner_points)), App, Part)
+    inner_edge = _freecad_bspline_edge(list(reversed(inner_points)), App, Part, endpoint_tangents=True)
     edges = [outer_edge]
     edges.extend(_freecad_line_edges(end_connector, App, Part))
     edges.append(inner_edge)
@@ -3896,12 +4000,27 @@ def vector(point):
     return App.Vector(float(point[0]), float(point[1]), float(point[2]))
 
 
-def bspline_edge(points):
+def bspline_edge(points, endpoint_tangents=False):
     if len(points) == 2:
         return Part.LineSegment(vector(points[0]), vector(points[1])).toShape()
     curve = Part.BSplineCurve()
-    curve.interpolate([vector(point) for point in points])
+    vectors = [vector(point) for point in points]
+    if endpoint_tangents:
+        curve.interpolate(vectors, InitialTangent=spline_tangent(points, "start"), FinalTangent=spline_tangent(points, "end"))
+    else:
+        curve.interpolate(vectors)
     return curve.toShape()
+
+
+def spline_tangent(points, end):
+    if end == "start":
+        raw = [points[1][0] - points[0][0], points[1][1] - points[0][1], points[1][2] - points[0][2]]
+    else:
+        raw = [points[-1][0] - points[-2][0], points[-1][1] - points[-2][1], points[-1][2] - points[-2][2]]
+    norm = (raw[0] ** 2 + raw[1] ** 2 + raw[2] ** 2) ** 0.5
+    if norm <= 1e-12:
+        return App.Vector(1.0, 0.0, 0.0)
+    return App.Vector(raw[0] / norm, raw[1] / norm, raw[2] / norm)
 
 
 def face_from_points(points):
@@ -3919,7 +4038,7 @@ def line_edges(points):
 
 
 def face_between_curves(outer_points, inner_points, start_connector=None, end_connector=None):
-    outer_edge = bspline_edge(outer_points)
+    outer_edge = bspline_edge(outer_points, endpoint_tangents=True)
     if start_connector is None:
         start_connector = [inner_points[0], outer_points[0]]
     if end_connector is None:
@@ -3928,13 +4047,13 @@ def face_between_curves(outer_points, inner_points, start_connector=None, end_co
         # FreeCAD can occasionally fill long, thin spline wires with a spurious
         # rectangular face; a ruled surface keeps these strip regions bounded by
         # the intended inner and outer curves.
-        inner_edge = bspline_edge(inner_points)
+        inner_edge = bspline_edge(inner_points, endpoint_tangents=True)
         try:
             return Part.makeRuledSurface(outer_edge, inner_edge)
         except Exception:
             pass
 
-    inner_edge = bspline_edge(list(reversed(inner_points)))
+    inner_edge = bspline_edge(list(reversed(inner_points)), endpoint_tangents=True)
     edges = [outer_edge]
     edges.extend(line_edges(end_connector))
     edges.append(inner_edge)

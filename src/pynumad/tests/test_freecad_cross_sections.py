@@ -21,8 +21,10 @@ from pynumad.analysis.freecad import (
     yaml_station_count,
 )
 from pynumad.analysis.freecad.make_cross_sections import (
+    _polyline_lengths,
     _regions_in_shape_face_order,
     _regions_in_shape_face_order_with_messages,
+    _resample_curve_by_spline,
     _shell_laminate_vertex_contact_messages,
 )
 
@@ -496,6 +498,48 @@ def test_shell_component_adhesive_keeps_spar_boundary_colinear():
         spar_connector = getattr(spar_layer, spar_connector_name)
         adhesive_connector = getattr(adhesive, adhesive_connector_name)
         assert _segments_colinear(spar_connector[0], spar_connector[-1], adhesive_connector[0], adhesive_connector[-1])
+
+
+def test_shell_spline_resampling_preserves_endpoints_and_densifies_curve():
+    points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.3, 0.08, 0.0],
+            [0.7, 0.06, 0.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+
+    resampled = _resample_curve_by_spline(points, spacing=0.05, min_points=8, max_points=80)
+
+    assert len(resampled) > len(points)
+    assert np.allclose(resampled[0], points[0])
+    assert np.allclose(resampled[-1], points[-1])
+    assert np.all(np.diff(_polyline_lengths(resampled)) > 0)
+
+
+def test_shell_side_resampling_keeps_outer_boundary_tangent_continuity():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_resample_enabled": True,
+        "shell_resample_scope": "side",
+        "shell_resample_spacing": 0.005,
+        "shell_resample_min_points": 12,
+        "shell_resample_max_points": 400,
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    hp_te_panel = next(region for region in section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer00")
+    hp_spar = next(region for region in section.regions if region.name == "Station010_HP_03_10_HP_SPAR_layer00")
+
+    assert np.allclose(hp_te_panel.outer_points[-1], hp_spar.outer_points[0])
+    assert _segments_colinear(
+        hp_te_panel.outer_points[-2],
+        hp_te_panel.outer_points[-1],
+        hp_spar.outer_points[0],
+        hp_spar.outer_points[1],
+        tolerance=8e-2,
+    )
 
 
 def test_record_turbine_message_creates_metadata_error_channel():
@@ -1139,7 +1183,7 @@ def _polygon_area(points):
 def _segments_colinear(first_start, first_end, second_start, second_end, tolerance=1e-9):
     first = first_end[:2] - first_start[:2]
     second = second_end[:2] - second_start[:2]
-    if np.linalg.norm(first) <= tolerance or np.linalg.norm(second) <= tolerance:
+    if np.linalg.norm(first) <= 1e-12 or np.linalg.norm(second) <= 1e-12:
         return False
     return abs(np.cross(first, second)) / (np.linalg.norm(first) * np.linalg.norm(second)) <= tolerance
 
