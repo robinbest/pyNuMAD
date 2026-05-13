@@ -2259,7 +2259,7 @@ def _flatback_te_adhesive_regions(station, flatback_te, shell_regions, cs_params
     ]
 
 
-def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, tolerance=1e-8, skipped_outer_tolerance=1e-3):
+def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, tolerance=1e-8):
     """Collect a through-thickness connector at a trimmed shell end.
 
     Regions are sorted by layer index and chained from the supplied outer point
@@ -2267,8 +2267,8 @@ def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, t
     units are skipped, which keeps unrelated or numerically disconnected layers
     out of the adhesive boundary.  If a thin gelcoat face is intentionally
     omitted, the first emitted shell layer begins just inward of ``outer_point``;
-    that small initial gap is accepted so TE adhesive still closes through the
-    skipped thickness.
+    that small initial gap is accepted based on the first emitted layer
+    connector length so the check is independent of output units.
     """
 
     candidates_by_layer = []
@@ -2288,11 +2288,13 @@ def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, t
 
     candidates_by_layer.sort(key=lambda item: item[0])
     points = [outer_point]
-    for _, region in candidates_by_layer:
+    for layer, region in candidates_by_layer:
         region_outer_point = region.outer_points[0] if connector_end == "start" else region.outer_points[-1]
         gap = np.linalg.norm(region_outer_point - points[-1])
         if gap > tolerance:
-            if len(points) == 1 and gap <= skipped_outer_tolerance:
+            connector = region.start_connector if connector_end == "start" else region.end_connector
+            connector_length = _polyline_lengths(connector)[-1] if connector is not None and len(connector) >= 2 else 0.0
+            if len(points) == 1 and layer > 0 and gap <= max(1e-3, 2.0 * connector_length):
                 points.append(region_outer_point)
             else:
                 continue

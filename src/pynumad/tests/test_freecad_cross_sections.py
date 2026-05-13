@@ -537,6 +537,20 @@ def test_skip_shell_gelcoat_layer_keeps_trailing_edge_adhesive():
     )
 
 
+def test_scaled_skip_shell_gelcoat_layer_keeps_trailing_edge_adhesive():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"skip_shell_gelcoat_layer": True, "geometry_scaling": 1000.0},
+    )
+
+    te_adhesive = next(region for region in section.regions if region.name == "Station010_TE_adhesive")
+    assert te_adhesive.material_name == "Adhesive"
+
+
 def test_skip_shell_gelcoat_layer_keeps_non_gelcoat_layer00():
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
     blade.stackdb.stacks[1, 10].plygroups[0].materialid = "glass_triax"
