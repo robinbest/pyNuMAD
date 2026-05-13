@@ -1089,6 +1089,41 @@ def test_write_detailed_freecad_cross_sections_script(tmp_path):
     assert '"start_connector": [' in contents
 
 
+def test_cs_params_geometry_scaling_generates_millimeter_sections():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    meter_section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    mm_section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    assert np.allclose(mm_section.hp_points, 1000.0 * meter_section.hp_points)
+    assert np.allclose(mm_section.lp_points, 1000.0 * meter_section.lp_points)
+    meter_region = next(region for region in meter_section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    mm_region = next(region for region in mm_section.regions if region.name == meter_region.name)
+    assert np.isclose(mm_region.plies[0]["thickness"], 1000.0 * meter_region.plies[0]["thickness"])
+
+
+def test_write_detailed_script_uses_cs_params_geometry_scaling_for_laminates(tmp_path):
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    script_path = write_freecad_cross_sections(
+        blade,
+        "blade",
+        station_list=[10],
+        directory=tmp_path,
+        move_le_to_origin=True,
+        detailed=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    contents = script_path.read_text(encoding="utf-8")
+    assert '"thickness": 1.0' in contents
+
+
 def _has_self_intersection(points):
     for i_point in range(len(points)):
         first_start = points[i_point]

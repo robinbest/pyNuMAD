@@ -180,6 +180,7 @@ def get_detailed_cross_section(
     for stations where web stacks are present.
     """
 
+    geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
     section = get_cross_section(
         blade,
         station,
@@ -240,6 +241,7 @@ def write_freecad_cross_sections(
 
     out_dir = Path(directory).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
 
     section_builder = get_detailed_cross_section if detailed else get_cross_section
     sections = []
@@ -322,6 +324,7 @@ def make_freecad_cross_section_parts(
         App, _ = _require_freecad_modules()
         doc = App.ActiveDocument or App.newDocument("pyNuMAD_cross_sections")
 
+    geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
     material_table = material_definitions(blade) if detailed else []
     laminate_table = (
         global_laminate_definitions(
@@ -425,6 +428,14 @@ def record_turbine_message(doc, severity, code, message, *, station=None, source
         ],
     )
     return metadata_obj
+
+
+def _cs_geometry_scaling(geometry_scaling, cs_params):
+    """Return geometry scaling, allowing ``cs_params`` to override it."""
+
+    if cs_params and cs_params.get("geometry_scaling") is not None:
+        return float(cs_params["geometry_scaling"])
+    return geometry_scaling
 
 
 def make_freecad_section_part(
