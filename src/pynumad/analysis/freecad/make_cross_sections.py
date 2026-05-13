@@ -2053,6 +2053,7 @@ def _perimeter_shell_regions(
         offset_curves = _offset_curves_by_thickness(combined_outer, section.closed_points, thicknesses)
         _close_matching_curve_endpoints(offset_curves)
         _square_disconnected_segment_boundaries(offset_curves, segment_slices, current_segments)
+        _square_connected_segment_boundaries(offset_curves, segment_slices, current_segments)
         _square_stair_step_boundaries(
             offset_curves,
             thicknesses,
@@ -2090,6 +2091,7 @@ def _perimeter_shell_regions(
                 "end",
                 _is_closed_polyline(combined_outer),
             )
+            inner_segment = _remove_endpoint_backtracking_points(inner_segment)
             if stack_name_counts[(sides[i_segment], stack.name)] > 1 and (i_segment == 0 or i_segment == len(stacks) - 1):
                 outer_segment = np.vstack((outer_segment[0], outer_segment[-1]))
                 inner_segment = np.vstack((inner_segment[0], inner_segment[-1]))
@@ -2423,10 +2425,58 @@ def _square_disconnected_segment_boundaries(offset_curves, segment_slices, curre
     """Square offsets at gaps between non-connected neighboring segments."""
 
     for i_segment, (start, end) in enumerate(segment_slices):
-        if i_segment > 0 and np.linalg.norm(current_segments[i_segment - 1][-1] - current_segments[i_segment][0]) > tolerance:
-            _square_offset_curve_endpoint(offset_curves, current_segments[i_segment], start, "start")
-        if i_segment < len(segment_slices) - 1 and np.linalg.norm(current_segments[i_segment][-1] - current_segments[i_segment + 1][0]) > tolerance:
-            _square_offset_curve_endpoint(offset_curves, current_segments[i_segment], end - 1, "end")
+        if i_segment > 0:
+            gap = current_segments[i_segment][0] - current_segments[i_segment - 1][-1]
+            if np.linalg.norm(gap) > tolerance:
+                _square_gap_offset_endpoint(offset_curves, start, gap)
+        if i_segment < len(segment_slices) - 1:
+            gap = current_segments[i_segment + 1][0] - current_segments[i_segment][-1]
+            if np.linalg.norm(gap) > tolerance:
+                _square_gap_offset_endpoint(offset_curves, end - 1, gap)
+
+
+def _square_gap_offset_endpoint(offset_curves, boundary_index, gap):
+    """Place offset endpoints along a stair-step gap direction."""
+
+    direction = _unit(gap)
+    outer_point = offset_curves[0.0][boundary_index]
+    for thickness, points in offset_curves.items():
+        if thickness <= 0:
+            continue
+        current_offset = points[boundary_index] - outer_point
+        oriented_direction = -direction if np.dot(direction, current_offset) < 0 else direction
+        points[boundary_index] = outer_point + oriented_direction * thickness
+
+
+def _square_connected_segment_boundaries(offset_curves, segment_slices, current_segments, tolerance=1e-9):
+    """Place connected stack-boundary offsets on a shared local normal."""
+
+    for i_segment in range(1, len(segment_slices)):
+        previous_segment = current_segments[i_segment - 1]
+        current_segment = current_segments[i_segment]
+        if np.linalg.norm(previous_segment[-1] - current_segment[0]) > tolerance:
+            continue
+        boundary_index = segment_slices[i_segment][0]
+        outer_point = offset_curves[0.0][boundary_index]
+        tangent = _shared_segment_boundary_tangent(previous_segment, current_segment)
+        normal = _perp(tangent)
+        for thickness, points in offset_curves.items():
+            if thickness <= 0:
+                continue
+            current_offset = points[boundary_index] - outer_point
+            oriented_normal = -normal if np.dot(normal, current_offset) < 0 else normal
+            points[boundary_index] = outer_point + oriented_normal * thickness
+
+
+def _shared_segment_boundary_tangent(previous_segment, current_segment):
+    """Return a common tangent for two connected shell segments."""
+
+    previous_tangent = _segment_end_tangent(previous_segment, "end")
+    current_tangent = _segment_end_tangent(current_segment, "start")
+    tangent = previous_tangent + current_tangent
+    if np.linalg.norm(tangent) <= 1e-12:
+        tangent = previous_tangent
+    return _unit(tangent)
 
 
 def _square_offset_curve_endpoint(offset_curves, outer_segment, boundary_index, boundary_end):
@@ -2526,6 +2576,25 @@ def _square_stair_step_endpoint(
         inner_segment[0] = squared_point
     else:
         inner_segment[-1] = squared_point
+
+
+def _remove_endpoint_backtracking_points(points, tolerance=1e-9):
+    """Remove tiny endpoint reversals while preserving endpoint topology."""
+
+    points = _remove_start_backtracking_points(points, tolerance)
+    points = np.flip(_remove_start_backtracking_points(np.flip(points, axis=0), tolerance), axis=0)
+    return points
+
+
+def _remove_start_backtracking_points(points, tolerance):
+    points = list(points)
+    while len(points) > 2:
+        reference = points[2] - points[0]
+        candidate = points[1] - points[0]
+        if np.linalg.norm(reference) <= tolerance or np.dot(candidate, reference) > tolerance:
+            break
+        points.pop(1)
+    return np.array(points)
 
 
 def _segment_end_tangent(points, boundary_end):

@@ -551,6 +551,54 @@ def test_scaled_skip_shell_gelcoat_layer_keeps_trailing_edge_adhesive():
     assert te_adhesive.material_name == "Adhesive"
 
 
+def test_shell_stack_boundary_connector_is_normal_with_scaled_gelcoat_skip():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    te_panel = next(region for region in section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    spar = next(region for region in section.regions if region.name == "Station010_HP_03_10_HP_SPAR_layer01")
+
+    assert np.allclose(te_panel.outer_points[-1], spar.outer_points[0])
+    assert np.allclose(te_panel.inner_points[-1], spar.inner_points[0])
+    tangent = _unit_2d(
+        _unit_2d(te_panel.outer_points[-1, :2] - te_panel.outer_points[-2, :2])
+        + _unit_2d(spar.outer_points[1, :2] - spar.outer_points[0, :2])
+    )
+    connector = _unit_2d(te_panel.inner_points[-1, :2] - te_panel.outer_points[-1, :2])
+    assert abs(np.dot(tangent, connector)) < 1e-8
+
+
+def test_stair_step_squaring_preserves_leading_edge_topology_with_near_normal_connector():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    adjacent_region = next(region for region in section.regions if region.name == "Station010_HP_04_10_HP_LE_PANEL_layer02")
+    previous_layer = next(region for region in section.regions if region.name == "Station010_HP_05_10_HP_LE_layer02")
+    le_region = next(region for region in section.regions if region.name == "Station010_HP_05_10_HP_LE_layer03")
+    tangent = _unit_2d(le_region.outer_points[1, :2] - le_region.outer_points[0, :2])
+    connector = _unit_2d(le_region.inner_points[0, :2] - le_region.outer_points[0, :2])
+    stair_direction = _unit_2d(adjacent_region.end_connector[-1, :2] - le_region.outer_points[0, :2])
+
+    assert np.allclose(le_region.outer_points[0], previous_layer.inner_points[0])
+    assert np.allclose(le_region.outer_points, previous_layer.inner_points)
+    assert np.dot(le_region.outer_points[1, :2] - le_region.outer_points[0, :2], le_region.outer_points[2, :2] - le_region.outer_points[0, :2]) > 0.0
+    assert np.dot(le_region.inner_points[1, :2] - le_region.inner_points[0, :2], le_region.inner_points[2, :2] - le_region.inner_points[0, :2]) > 0.0
+    assert abs(np.cross(stair_direction, connector)) < 1e-8
+    assert abs(np.dot(tangent, connector)) < np.sin(np.deg2rad(10.0))
+
+
 def test_skip_shell_gelcoat_layer_keeps_non_gelcoat_layer00():
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
     blade.stackdb.stacks[1, 10].plygroups[0].materialid = "glass_triax"
@@ -1236,6 +1284,13 @@ def _polygon_area(points):
     return 0.5 * abs(
         np.dot(points[:-1, 0], points[1:, 1]) - np.dot(points[1:, 0], points[:-1, 1])
     )
+
+
+def _unit_2d(vector):
+    norm = np.linalg.norm(vector)
+    if norm <= 0:
+        return np.array([1.0, 0.0])
+    return vector / norm
 
 
 def _segments_colinear(first_start, first_end, second_start, second_end, tolerance=1e-9):
