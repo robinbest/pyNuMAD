@@ -498,6 +498,61 @@ def test_shell_component_adhesive_keeps_spar_boundary_colinear():
         assert _segments_colinear(spar_connector[0], spar_connector[-1], adhesive_connector[0], adhesive_connector[-1])
 
 
+def test_shell_component_adhesive_splits_previous_layer_shared_edges():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    layer01 = next(region for region in section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    layer02 = next(region for region in section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer02")
+    adhesive = next(
+        region
+        for region in section.regions
+        if region.name == "Station010_HP_02_10_HP_TE_PANEL_to_03_10_HP_SPAR_adhesive_layer02"
+    )
+
+    assert layer01.edge_points is not None
+    assert _regions_share_edge(layer01, layer02)
+    assert _regions_share_edge(layer01, adhesive)
+
+
+def test_all_shell_component_adhesive_splits_are_shared():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    shell_regions = [region for region in section.regions if ("_HP_" in region.name or "_LP_" in region.name)]
+    shell_adhesives = [
+        region
+        for region in shell_regions
+        if "_to_" in region.name and region.material_name == "Adhesive"
+    ]
+
+    assert len(shell_adhesives) == 4
+    split_previous_layers = [
+        region
+        for region in shell_regions
+        if region.edge_points is not None and region.name.endswith("_layer01")
+    ]
+    assert split_previous_layers
+    for region in split_previous_layers:
+        for edge in region.edge_points[2:-1]:
+            matches = [
+                candidate
+                for candidate in shell_regions
+                if candidate is not region and _region_has_edge(candidate, edge)
+            ]
+            assert matches, region.name
+
+
 def test_skip_shell_gelcoat_layer_omits_layer00_but_preserves_inner_geometry():
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
 
@@ -1236,14 +1291,27 @@ def _web_adhesive_cs_params(blade):
 
 
 def _region_has_edge(region, edge):
-    for candidate in region.edge_points or []:
+    for candidate in _region_edges(region):
         if _edges_match(candidate, edge):
             return True
     return False
 
 
 def _regions_share_edge(first, second):
-    return any(_region_has_edge(first, edge) for edge in second.edge_points or [])
+    return any(_region_has_edge(first, edge) for edge in _region_edges(second))
+
+
+def _region_edges(region):
+    if region.edge_points is not None:
+        return region.edge_points
+    if region.outer_points is None:
+        return []
+    return [
+        region.outer_points,
+        region.end_connector,
+        region.inner_points,
+        region.start_connector,
+    ]
 
 
 def _region_boundary_contains_points(region, points):

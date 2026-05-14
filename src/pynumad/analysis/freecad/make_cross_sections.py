@@ -1792,6 +1792,7 @@ def _apply_shell_component_adhesives_for_layer(stacks, sides, current_segments, 
     new_stacks = []
     new_sides = []
     new_segments = []
+    split_specs = []
     i_segment = 0
     while i_segment < len(stacks):
         stack = stacks[i_segment]
@@ -1825,8 +1826,24 @@ def _apply_shell_component_adhesives_for_layer(stacks, sides, current_segments, 
                 kept_right = _polyline_between(next_segment, right_trim, right_length)
                 if next_stack_is_spar:
                     adhesive_segment = _clean_polyline(np.vstack((kept_left[-1], segment[-1])))
+                    split_specs.append(
+                        {
+                            "side": side,
+                            "stack_index": i_segment,
+                            "layer": i_layer - 1,
+                            "interface_edge": adhesive_segment,
+                        }
+                    )
                 else:
                     adhesive_segment = _clean_polyline(np.vstack((segment[-1], kept_right[0])))
+                    split_specs.append(
+                        {
+                            "side": side,
+                            "stack_index": i_segment + 1,
+                            "layer": i_layer - 1,
+                            "interface_edge": adhesive_segment,
+                        }
+                    )
                 new_stacks.append(stack)
                 new_sides.append(side)
                 new_segments.append(kept_left)
@@ -1842,7 +1859,44 @@ def _apply_shell_component_adhesives_for_layer(stacks, sides, current_segments, 
         new_segments.append(segment)
         i_segment += 1
 
-    return new_stacks, new_sides, new_segments
+    return new_stacks, new_sides, new_segments, split_specs
+
+
+def _split_previous_shell_regions_for_component_adhesives(
+    regions,
+    split_specs,
+    stacks,
+    sides,
+    stack_name_counts,
+    station,
+):
+    """Split already-emitted shell edges that newly inserted adhesive shares.
+
+    Shell component adhesives are inserted at the first non-common layer.  The
+    previous layer has already been emitted with one continuous inner edge, so
+    split that edge at the adhesive interval to keep the topology one-to-one.
+    """
+
+    if not split_specs:
+        return
+
+    regions_by_name = {region.name: region for region in regions}
+    for split_spec in split_specs:
+        layer = split_spec["layer"]
+        if layer < 0:
+            continue
+        i_segment = split_spec["stack_index"]
+        if i_segment >= len(stacks):
+            continue
+        region_name = (
+            f"Station{station:03d}_{sides[i_segment]}_"
+            f"{_shell_region_stack_name(stacks[i_segment], sides, stack_name_counts, i_segment)}_"
+            f"layer{layer:02d}"
+        )
+        region = regions_by_name.get(region_name)
+        if region is None:
+            continue
+        _split_region_inner_edge_for_interfaces(region, [split_spec["interface_edge"]])
 
 
 def _is_spar_component_boundary(first_stack, second_stack):
@@ -2030,12 +2084,23 @@ def _perimeter_shell_regions(
 
     for i_layer in range(max_layers):
         if any(spec["insert_layer"] == i_layer for spec in shell_component_adhesives):
-            stacks, sides, current_segments = _apply_shell_component_adhesives_for_layer(
+            previous_stacks = stacks
+            previous_sides = sides
+            previous_stack_name_counts = stack_name_counts
+            stacks, sides, current_segments, split_specs = _apply_shell_component_adhesives_for_layer(
                 stacks,
                 sides,
                 current_segments,
                 i_layer,
                 shell_component_adhesives,
+            )
+            _split_previous_shell_regions_for_component_adhesives(
+                regions,
+                split_specs,
+                previous_stacks,
+                previous_sides,
+                previous_stack_name_counts,
+                station,
             )
             stack_name_counts = {
                 (side, stack.name): sum(1 for other_side, other_stack in zip(sides, stacks) if other_side == side and other_stack.name == stack.name)
