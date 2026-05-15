@@ -159,7 +159,11 @@ def get_cross_section(
         te_point=xyz[0, :],
         hp_points=hp_points,
         lp_points=lp_points,
-        station_frame=station_frame_definition(blade, station),
+        station_frame=station_frame_definition(
+            blade,
+            station,
+            geometry_scaling=geometry_scaling,
+        ),
     )
 
 
@@ -1050,7 +1054,7 @@ def get_yaml_station_count(yaml_path):
     return yaml_station_count(yaml_path)
 
 
-def station_frame_definition(blade, station):
+def station_frame_definition(blade, station, *, geometry_scaling=1.0):
     """Return reference-axis orientation data for one blade station.
 
     WindIO stores the blade generating line in
@@ -1068,7 +1072,7 @@ def station_frame_definition(blade, station):
 
     geometry = blade.geometry
     span = np.asarray(blade.definition.ispan, dtype=float)
-    origin = np.array(
+    origin_m = np.array(
         [
             -blade.definition.rotorspin * geometry.isweep[station],
             geometry.iprebend[station],
@@ -1076,6 +1080,8 @@ def station_frame_definition(blade, station):
         ],
         dtype=float,
     )
+    origin = origin_m * geometry_scaling
+    units = _scaled_length_units(geometry_scaling)
     dx_dz = _station_derivative(span, -blade.definition.rotorspin * geometry.isweep, station)
     dy_dz = _station_derivative(span, geometry.iprebend, station)
     twist_deg = float(geometry.idegreestwist[station])
@@ -1083,14 +1089,15 @@ def station_frame_definition(blade, station):
 
     return {
         "station": int(station),
-        "span": _json_value(span[station]),
+        "span": _json_value(span[station] * geometry_scaling),
         "origin": _json_value(origin),
-        "origin_units": "m",
+        "origin_units": units,
+        "geometry_scaling": _json_value(float(geometry_scaling)),
         "reference_axis": {
             "x": _json_value(origin[0]),
             "y": _json_value(origin[1]),
             "z": _json_value(origin[2]),
-            "units": "m",
+            "units": units,
         },
         "rotations": {
             "prebend_angle_deg": _json_value(np.rad2deg(np.arctan2(dy_dz, 1.0))),
@@ -1106,6 +1113,16 @@ def station_frame_definition(blade, station):
             "z_axis": _json_value(basis[:, 2]),
         },
     }
+
+
+def _scaled_length_units(geometry_scaling):
+    """Return a human-readable unit label for scaled meter coordinates."""
+
+    if np.isclose(geometry_scaling, 1.0):
+        return "m"
+    if np.isclose(geometry_scaling, 1000.0):
+        return "mm"
+    return "scaled"
 
 
 def _station_derivative(span, values, station):

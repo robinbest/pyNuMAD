@@ -139,6 +139,7 @@ def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
 
     assert frame["station"] == 10
     np.testing.assert_allclose(frame["origin"], [0.0, blade.geometry.iprebend[10], blade.ispan[10]])
+    assert frame["origin_units"] == "m"
     assert set(frame["rotations"]) == {
         "prebend_angle_deg",
         "sweep_angle_deg",
@@ -148,6 +149,41 @@ def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
     }
     assert abs(frame["rotations"]["twist_deg"] - blade.geometry.idegreestwist[10]) < 1e-12
     np.testing.assert_allclose(basis.T @ basis, np.eye(3), atol=1e-12)
+
+
+def test_cs_params_geometry_scaling_scales_station_frame_origin():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    meter_section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    mm_section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    np.testing.assert_allclose(
+        mm_section.station_frame["origin"],
+        1000.0 * np.array(meter_section.station_frame["origin"]),
+    )
+    assert mm_section.station_frame["span"] == 1000.0 * meter_section.station_frame["span"]
+    assert mm_section.station_frame["origin_units"] == "mm"
+    assert mm_section.station_frame["reference_axis"]["units"] == "mm"
+
+
+def test_arbitrary_geometry_scaling_uses_scaled_station_frame_units():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 25.0},
+    )
+
+    assert section.station_frame["geometry_scaling"] == 25.0
+    assert section.station_frame["origin_units"] == "scaled"
+    assert section.station_frame["reference_axis"]["units"] == "scaled"
 
 
 def test_freecad_direct_api_is_importable_without_freecad():
