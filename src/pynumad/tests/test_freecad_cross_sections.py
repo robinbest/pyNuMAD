@@ -23,6 +23,7 @@ from pynumad.analysis.freecad import (
 from pynumad.analysis.freecad.make_cross_sections import (
     _regions_in_shape_face_order,
     _regions_in_shape_face_order_with_messages,
+    _shell_laminate_vertex_contact_messages,
 )
 
 
@@ -377,6 +378,294 @@ def test_face_material_reorder_returns_warning_when_signatures_are_unavailable()
     assert messages[0]["station"] == 10
     assert messages[0]["source"] == "freecad_cross_sections.face_material_map"
     assert "region-generation order" in messages[0]["message"]
+
+
+def test_shell_laminate_vertex_contact_warning_identifies_spar_cap_skin_step():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+
+    messages = _shell_laminate_vertex_contact_messages(section.regions)
+    target = next(
+        message
+        for message in messages
+        if message["details"]["first_region_name"] == "Station010_HP_03_10_HP_SPAR_layer02"
+        and message["details"]["second_region_name"] == "Station010_HP_02_10_HP_TE_PANEL_layer03"
+    )
+
+    assert target["severity"] == "warning"
+    assert target["code"] == "shell_laminate_vertex_contact"
+    assert target["station"] == 10
+    assert target["details"]["first_face_index"] == 22
+    assert target["details"]["second_face_index"] == 31
+    assert np.isclose(target["details"]["first_thickness"], 0.095)
+    assert np.isclose(target["details"]["second_thickness"], 0.003)
+
+
+def test_shell_component_adhesive_inserts_four_spar_boundary_faces():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    metadata = face_material_metadata(
+        section.regions,
+        laminate_table=global_laminate_definitions(blade),
+        material_table=material_definitions(blade),
+    )
+    shell_adhesives = [
+        item
+        for item in metadata
+        if "_to_" in item["region_name"] and item["material_name"] == "Adhesive"
+    ]
+
+    assert len(shell_adhesives) == 4
+    assert all("_adhesive_layer00" not in item["region_name"] for item in metadata)
+    assert all("_adhesive_layer01" not in item["region_name"] for item in metadata)
+    assert {item["layer"] for item in shell_adhesives} == {2}
+    assert all(item["material_name"] == "Adhesive" for item in shell_adhesives)
+    assert all(item["assignment_type"] == "material" for item in shell_adhesives)
+    assert all("SPAR" in item["region_name"] for item in shell_adhesives)
+    assert _shell_laminate_vertex_contact_messages(section.regions) == []
+
+
+def test_shell_component_adhesive_preserves_common_outer_layer_areas():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    baseline = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    with_adhesive = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    baseline_areas = {
+        region.name: _polygon_area(_region_polygon(region))
+        for region in baseline.regions
+        if ("_HP_" in region.name or "_LP_" in region.name)
+        and (region.name.endswith("_layer00") or region.name.endswith("_layer01"))
+    }
+
+    for region in with_adhesive.regions:
+        if "_to_" in region.name:
+            assert not region.name.endswith("_layer00")
+            assert not region.name.endswith("_layer01")
+            continue
+        if region.name in baseline_areas:
+            assert np.isclose(_polygon_area(_region_polygon(region)), baseline_areas[region.name])
+
+
+def test_shell_component_adhesive_keeps_spar_boundary_colinear():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    checks = [
+        (
+            "Station010_HP_03_10_HP_SPAR_layer01",
+            "start_connector",
+            "Station010_HP_02_10_HP_TE_PANEL_to_03_10_HP_SPAR_adhesive_layer02",
+            "end_connector",
+        ),
+        (
+            "Station010_HP_03_10_HP_SPAR_layer01",
+            "end_connector",
+            "Station010_HP_03_10_HP_SPAR_to_04_10_HP_LE_PANEL_adhesive_layer02",
+            "start_connector",
+        ),
+        (
+            "Station010_LP_08_10_LP_SPAR_layer01",
+            "start_connector",
+            "Station010_LP_07_10_LP_LE_PANEL_to_08_10_LP_SPAR_adhesive_layer02",
+            "end_connector",
+        ),
+        (
+            "Station010_LP_08_10_LP_SPAR_layer01",
+            "end_connector",
+            "Station010_LP_08_10_LP_SPAR_to_09_10_LP_TE_PANEL_adhesive_layer02",
+            "start_connector",
+        ),
+    ]
+
+    for spar_layer_name, spar_connector_name, adhesive_name, adhesive_connector_name in checks:
+        spar_layer = next(region for region in section.regions if region.name == spar_layer_name)
+        adhesive = next(region for region in section.regions if region.name == adhesive_name)
+        spar_connector = getattr(spar_layer, spar_connector_name)
+        adhesive_connector = getattr(adhesive, adhesive_connector_name)
+        assert _segments_colinear(spar_connector[0], spar_connector[-1], adhesive_connector[0], adhesive_connector[-1])
+
+
+def test_shell_component_adhesive_splits_previous_layer_shared_edges():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    layer01 = next(region for region in section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    layer02 = next(region for region in section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer02")
+    adhesive = next(
+        region
+        for region in section.regions
+        if region.name == "Station010_HP_02_10_HP_TE_PANEL_to_03_10_HP_SPAR_adhesive_layer02"
+    )
+
+    assert layer01.edge_points is not None
+    assert _regions_share_edge(layer01, layer02)
+    assert _regions_share_edge(layer01, adhesive)
+
+
+def test_all_shell_component_adhesive_splits_are_shared():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    shell_regions = [region for region in section.regions if ("_HP_" in region.name or "_LP_" in region.name)]
+    shell_adhesives = [
+        region
+        for region in shell_regions
+        if "_to_" in region.name and region.material_name == "Adhesive"
+    ]
+
+    assert len(shell_adhesives) == 4
+    split_previous_layers = [
+        region
+        for region in shell_regions
+        if region.edge_points is not None and region.name.endswith("_layer01")
+    ]
+    assert split_previous_layers
+    for region in split_previous_layers:
+        for edge in region.edge_points[2:-1]:
+            matches = [
+                candidate
+                for candidate in shell_regions
+                if candidate is not region and _region_has_edge(candidate, edge)
+            ]
+            assert matches, region.name
+
+
+def test_skip_shell_gelcoat_layer_omits_layer00_but_preserves_inner_geometry():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    baseline = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    skipped = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"skip_shell_gelcoat_layer": True},
+    )
+
+    assert not any(
+        ("_HP_" in region.name or "_LP_" in region.name) and region.name.endswith("_layer00")
+        for region in skipped.regions
+    )
+    baseline_layer01 = next(region for region in baseline.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    skipped_layer01 = next(region for region in skipped.regions if region.name == baseline_layer01.name)
+    assert np.allclose(skipped_layer01.outer_points, baseline_layer01.outer_points)
+    assert np.allclose(skipped_layer01.inner_points, baseline_layer01.inner_points)
+
+
+def test_skip_shell_gelcoat_layer_keeps_trailing_edge_adhesive():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"skip_shell_gelcoat_layer": True},
+    )
+
+    te_adhesive = next(region for region in section.regions if region.name == "Station010_TE_adhesive")
+    assert te_adhesive.material_name == "Adhesive"
+    assert not any(
+        ("_HP_" in region.name or "_LP_" in region.name) and region.name.endswith("_layer00")
+        for region in section.regions
+    )
+
+
+def test_scaled_skip_shell_gelcoat_layer_keeps_trailing_edge_adhesive():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"skip_shell_gelcoat_layer": True, "geometry_scaling": 1000.0},
+    )
+
+    te_adhesive = next(region for region in section.regions if region.name == "Station010_TE_adhesive")
+    assert te_adhesive.material_name == "Adhesive"
+
+
+def test_shell_stack_boundary_connector_is_normal_with_scaled_gelcoat_skip():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    te_panel = next(region for region in section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    spar = next(region for region in section.regions if region.name == "Station010_HP_03_10_HP_SPAR_layer01")
+
+    assert np.allclose(te_panel.outer_points[-1], spar.outer_points[0])
+    assert np.allclose(te_panel.inner_points[-1], spar.inner_points[0])
+    tangent = _unit_2d(
+        _unit_2d(te_panel.outer_points[-1, :2] - te_panel.outer_points[-2, :2])
+        + _unit_2d(spar.outer_points[1, :2] - spar.outer_points[0, :2])
+    )
+    connector = _unit_2d(te_panel.inner_points[-1, :2] - te_panel.outer_points[-1, :2])
+    assert abs(np.dot(tangent, connector)) < 1e-8
+
+
+def test_stair_step_squaring_preserves_leading_edge_topology_with_near_normal_connector():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 10, move_le_to_origin=True, cs_params=cs_params)
+    adjacent_region = next(region for region in section.regions if region.name == "Station010_HP_04_10_HP_LE_PANEL_layer02")
+    previous_layer = next(region for region in section.regions if region.name == "Station010_HP_05_10_HP_LE_layer02")
+    le_region = next(region for region in section.regions if region.name == "Station010_HP_05_10_HP_LE_layer03")
+    tangent = _unit_2d(le_region.outer_points[1, :2] - le_region.outer_points[0, :2])
+    connector = _unit_2d(le_region.inner_points[0, :2] - le_region.outer_points[0, :2])
+    stair_direction = _unit_2d(adjacent_region.end_connector[-1, :2] - le_region.outer_points[0, :2])
+
+    assert np.allclose(le_region.outer_points[0], previous_layer.inner_points[0])
+    assert np.allclose(le_region.outer_points, previous_layer.inner_points)
+    assert np.dot(le_region.outer_points[1, :2] - le_region.outer_points[0, :2], le_region.outer_points[2, :2] - le_region.outer_points[0, :2]) > 0.0
+    assert np.dot(le_region.inner_points[1, :2] - le_region.inner_points[0, :2], le_region.inner_points[2, :2] - le_region.inner_points[0, :2]) > 0.0
+    assert abs(np.cross(stair_direction, connector)) < 1e-8
+    assert abs(np.dot(tangent, connector)) < np.sin(np.deg2rad(10.0))
+
+
+def test_skip_shell_gelcoat_layer_keeps_non_gelcoat_layer00():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    blade.stackdb.stacks[1, 10].plygroups[0].materialid = "glass_triax"
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"skip_shell_gelcoat_layer": True},
+    )
+
+    assert any(region.name == "Station010_HP_01_10_HP_TE_REINF_layer00" for region in section.regions)
 
 
 def test_record_turbine_message_creates_metadata_error_channel():
@@ -917,6 +1206,41 @@ def test_write_detailed_freecad_cross_sections_script(tmp_path):
     assert '"start_connector": [' in contents
 
 
+def test_cs_params_geometry_scaling_generates_millimeter_sections():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    meter_section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    mm_section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    assert np.allclose(mm_section.hp_points, 1000.0 * meter_section.hp_points)
+    assert np.allclose(mm_section.lp_points, 1000.0 * meter_section.lp_points)
+    meter_region = next(region for region in meter_section.regions if region.name == "Station010_HP_02_10_HP_TE_PANEL_layer01")
+    mm_region = next(region for region in mm_section.regions if region.name == meter_region.name)
+    assert np.isclose(mm_region.plies[0]["thickness"], 1000.0 * meter_region.plies[0]["thickness"])
+
+
+def test_write_detailed_script_uses_cs_params_geometry_scaling_for_laminates(tmp_path):
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    script_path = write_freecad_cross_sections(
+        blade,
+        "blade",
+        station_list=[10],
+        directory=tmp_path,
+        move_le_to_origin=True,
+        detailed=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    contents = script_path.read_text(encoding="utf-8")
+    assert '"thickness": 1.0' in contents
+
+
 def _has_self_intersection(points):
     for i_point in range(len(points)):
         first_start = points[i_point]
@@ -967,14 +1291,27 @@ def _web_adhesive_cs_params(blade):
 
 
 def _region_has_edge(region, edge):
-    for candidate in region.edge_points or []:
+    for candidate in _region_edges(region):
         if _edges_match(candidate, edge):
             return True
     return False
 
 
 def _regions_share_edge(first, second):
-    return any(_region_has_edge(first, edge) for edge in second.edge_points or [])
+    return any(_region_has_edge(first, edge) for edge in _region_edges(second))
+
+
+def _region_edges(region):
+    if region.edge_points is not None:
+        return region.edge_points
+    if region.outer_points is None:
+        return []
+    return [
+        region.outer_points,
+        region.end_connector,
+        region.inner_points,
+        region.start_connector,
+    ]
 
 
 def _region_boundary_contains_points(region, points):
@@ -1007,6 +1344,29 @@ def _region_polygon(region):
             region.start_connector[1:],
         )
     )
+
+
+def _polygon_area(points):
+    if not np.allclose(points[0], points[-1]):
+        points = np.vstack((points, points[0]))
+    return 0.5 * abs(
+        np.dot(points[:-1, 0], points[1:, 1]) - np.dot(points[1:, 0], points[:-1, 1])
+    )
+
+
+def _unit_2d(vector):
+    norm = np.linalg.norm(vector)
+    if norm <= 0:
+        return np.array([1.0, 0.0])
+    return vector / norm
+
+
+def _segments_colinear(first_start, first_end, second_start, second_end, tolerance=1e-9):
+    first = first_end[:2] - first_start[:2]
+    second = second_end[:2] - second_start[:2]
+    if np.linalg.norm(first) <= tolerance or np.linalg.norm(second) <= tolerance:
+        return False
+    return abs(np.cross(first, second)) / (np.linalg.norm(first) * np.linalg.norm(second)) <= tolerance
 
 
 def _segments_intersect(first_start, first_end, second_start, second_end):

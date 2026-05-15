@@ -21,9 +21,21 @@ def get_cs_params(blade):
     adhesive_thickness = np.full((total_stations,), 0.001)
 
     return {
+        # Scale cross-section geometry from meters to millimeters for meshing.
+        "geometry_scaling": 1000.0,
+
         "adhesive_mat_name": "Adhesive",
         "web_fore_adhesive_thickness": adhesive_thickness,
         "web_aft_adhesive_thickness": adhesive_thickness,
+
+
+        # shell spar-boundary adhesive
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+
+        # Skip shell layer00 only when it is gelcoat/coating. The gelcoat is a
+        # thin protective coating and can be too small for downstream meshing.
+        "skip_shell_gelcoat_layer": True,
     }
 
 
