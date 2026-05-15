@@ -1260,6 +1260,29 @@ def test_cs_params_geometry_scaling_generates_millimeter_sections():
     assert np.isclose(mm_region.plies[0]["thickness"], 1000.0 * meter_region.plies[0]["thickness"])
 
 
+def test_cs_params_move_le_to_origin_overrides_function_argument():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0, "move_le_to_origin": False},
+    )
+
+    assert not np.allclose(section.hp_points[-1, :2], [0.0, 0.0])
+
+
+def test_move_le_to_origin_false_keeps_station_coordinates():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    shifted = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    unshifted = get_detailed_cross_section(blade, 10, move_le_to_origin=False)
+
+    assert np.allclose(shifted.hp_points[-1, :2], [0.0, 0.0])
+    assert not np.allclose(unshifted.hp_points[-1, :2], [0.0, 0.0])
+
+
 def test_write_detailed_script_uses_cs_params_geometry_scaling_for_laminates(tmp_path):
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
 

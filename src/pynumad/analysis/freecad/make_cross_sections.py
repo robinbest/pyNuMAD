@@ -185,6 +185,7 @@ def get_detailed_cross_section(
     """
 
     geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
+    move_le_to_origin = _cs_move_le_to_origin(move_le_to_origin, cs_params)
     section = get_cross_section(
         blade,
         station,
@@ -246,6 +247,7 @@ def write_freecad_cross_sections(
     out_dir = Path(directory).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
+    move_le_to_origin = _cs_move_le_to_origin(move_le_to_origin, cs_params)
 
     section_builder = get_detailed_cross_section if detailed else get_cross_section
     sections = []
@@ -329,6 +331,7 @@ def make_freecad_cross_section_parts(
         doc = App.ActiveDocument or App.newDocument("pyNuMAD_cross_sections")
 
     geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
+    move_le_to_origin = _cs_move_le_to_origin(move_le_to_origin, cs_params)
     material_table = material_definitions(blade) if detailed else []
     laminate_table = (
         global_laminate_definitions(
@@ -440,6 +443,14 @@ def _cs_geometry_scaling(geometry_scaling, cs_params):
     if cs_params and cs_params.get("geometry_scaling") is not None:
         return float(cs_params["geometry_scaling"])
     return geometry_scaling
+
+
+def _cs_move_le_to_origin(move_le_to_origin, cs_params):
+    """Return LE-origin translation setting, allowing ``cs_params`` to override it."""
+
+    if cs_params and cs_params.get("move_le_to_origin") is not None:
+        return bool(cs_params["move_le_to_origin"])
+    return move_le_to_origin
 
 
 def make_freecad_section_part(
