@@ -140,6 +140,7 @@ def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
     assert frame["station"] == 10
     np.testing.assert_allclose(frame["origin"], [0.0, blade.geometry.iprebend[10], blade.ispan[10]])
     assert frame["origin_units"] == "m"
+    np.testing.assert_allclose(frame["section_translation"], [0.0, 0.0, 0.0])
     assert set(frame["rotations"]) == {
         "prebend_angle_deg",
         "sweep_angle_deg",
@@ -1281,6 +1282,38 @@ def test_move_le_to_origin_false_keeps_station_coordinates():
 
     assert np.allclose(shifted.hp_points[-1, :2], [0.0, 0.0])
     assert not np.allclose(unshifted.hp_points[-1, :2], [0.0, 0.0])
+
+
+def test_move_le_to_origin_shifts_station_frame_by_section_translation():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    unshifted = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=False,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+    shifted = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    translation = np.array(shifted.station_frame["section_translation"])
+    np.testing.assert_allclose(translation, -unshifted.hp_points[-1])
+    np.testing.assert_allclose(
+        shifted.station_frame["origin"],
+        np.array(unshifted.station_frame["origin"]) + translation,
+    )
+    np.testing.assert_allclose(
+        [
+            shifted.station_frame["reference_axis"]["x"],
+            shifted.station_frame["reference_axis"]["y"],
+            shifted.station_frame["reference_axis"]["z"],
+        ],
+        shifted.station_frame["origin"],
+    )
 
 
 def test_write_detailed_script_uses_cs_params_geometry_scaling_for_laminates(tmp_path):

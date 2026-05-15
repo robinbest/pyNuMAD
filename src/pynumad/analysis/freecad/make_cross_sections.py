@@ -148,8 +148,10 @@ def get_cross_section(
         chord = geometry.ichord[station] * geometry_scaling
         xyz = xyz / chord
 
+    section_translation = np.zeros(3)
     if move_le_to_origin:
-        xyz = xyz - xyz[i_le - 1, :]
+        section_translation = -xyz[i_le - 1, :]
+        xyz = xyz + section_translation
 
     hp_points = xyz[1:i_le, :]
     lp_points = np.flip(xyz, axis=0)[1:i_le, :]
@@ -163,6 +165,7 @@ def get_cross_section(
             blade,
             station,
             geometry_scaling=geometry_scaling,
+            section_translation=section_translation,
         ),
     )
 
@@ -1065,7 +1068,7 @@ def get_yaml_station_count(yaml_path):
     return yaml_station_count(yaml_path)
 
 
-def station_frame_definition(blade, station, *, geometry_scaling=1.0):
+def station_frame_definition(blade, station, *, geometry_scaling=1.0, section_translation=None):
     """Return reference-axis orientation data for one blade station.
 
     WindIO stores the blade generating line in
@@ -1091,7 +1094,8 @@ def station_frame_definition(blade, station, *, geometry_scaling=1.0):
         ],
         dtype=float,
     )
-    origin = origin_m * geometry_scaling
+    section_translation = np.zeros(3) if section_translation is None else np.asarray(section_translation, dtype=float)
+    origin = origin_m * geometry_scaling + section_translation
     units = _scaled_length_units(geometry_scaling)
     dx_dz = _station_derivative(span, -blade.definition.rotorspin * geometry.isweep, station)
     dy_dz = _station_derivative(span, geometry.iprebend, station)
@@ -1104,6 +1108,7 @@ def station_frame_definition(blade, station, *, geometry_scaling=1.0):
         "origin": _json_value(origin),
         "origin_units": units,
         "geometry_scaling": _json_value(float(geometry_scaling)),
+        "section_translation": _json_value(section_translation),
         "reference_axis": {
             "x": _json_value(origin[0]),
             "y": _json_value(origin[1]),
