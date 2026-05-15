@@ -1074,14 +1074,9 @@ def station_frame_definition(blade, station, *, geometry_scaling=1.0, section_tr
     WindIO stores the blade generating line in
     ``outer_shape_bem.reference_axis.x/y/z`` and the section twist in
     ``outer_shape_bem.twist``.  pyNuMAD imports those as sweep/prebend/span and
-    twist arrays.  This table keeps the physical reference-axis origin and a
-    right-handed local coordinate system so downstream tools can place a 2D
-    cross section in the curved/twisted blade frame.
-
-    The frame data always come from ``outer_shape_bem.reference_axis`` and use
-    a right-handed convention: ``z_axis`` follows the reference-axis tangent,
-    while ``x_axis``/``y_axis`` are twisted about ``z_axis``.  Those constants
-    are documented here instead of repeated in every station's JSON output.
+    twist arrays.  This table keeps the physical station origin, a planar
+    section LCS for HomoGen, and the swept/prebent reference-axis LCS for tools
+    that need the full blade-frame orientation.
     """
 
     geometry = blade.geometry
@@ -1100,7 +1095,8 @@ def station_frame_definition(blade, station, *, geometry_scaling=1.0, section_tr
     dx_dz = _station_derivative(span, -blade.definition.rotorspin * geometry.isweep, station)
     dy_dz = _station_derivative(span, geometry.iprebend, station)
     twist_deg = float(geometry.idegreestwist[station])
-    basis = _station_lcs_basis(dx_dz, dy_dz, twist_deg, blade.definition.rotorspin)
+    reference_basis = _station_lcs_basis(dx_dz, dy_dz, twist_deg, blade.definition.rotorspin)
+    section_basis = _section_lcs_basis(twist_deg, blade.definition.rotorspin)
 
     return {
         "station": int(station),
@@ -1109,12 +1105,6 @@ def station_frame_definition(blade, station, *, geometry_scaling=1.0, section_tr
         "origin_units": units,
         "geometry_scaling": _json_value(float(geometry_scaling)),
         "section_translation": _json_value(section_translation),
-        "reference_axis": {
-            "x": _json_value(origin[0]),
-            "y": _json_value(origin[1]),
-            "z": _json_value(origin[2]),
-            "units": units,
-        },
         "rotations": {
             "prebend_angle_deg": _json_value(np.rad2deg(np.arctan2(dy_dz, 1.0))),
             "sweep_angle_deg": _json_value(np.rad2deg(np.arctan2(dx_dz, 1.0))),
@@ -1124,9 +1114,15 @@ def station_frame_definition(blade, station, *, geometry_scaling=1.0, section_tr
         },
         "lcs": {
             "origin": _json_value(origin),
-            "x_axis": _json_value(basis[:, 0]),
-            "y_axis": _json_value(basis[:, 1]),
-            "z_axis": _json_value(basis[:, 2]),
+            "x_axis": _json_value(section_basis[:, 0]),
+            "y_axis": _json_value(section_basis[:, 1]),
+            "z_axis": _json_value(section_basis[:, 2]),
+        },
+        "reference_lcs": {
+            "origin": _json_value(origin),
+            "x_axis": _json_value(reference_basis[:, 0]),
+            "y_axis": _json_value(reference_basis[:, 1]),
+            "z_axis": _json_value(reference_basis[:, 2]),
         },
     }
 
@@ -1173,6 +1169,16 @@ def _station_lcs_basis(dx_dz, dy_dz, twist_deg, rotorspin):
     x_twisted = np.cos(twist) * x_axis + np.sin(twist) * y_axis
     y_twisted = -np.sin(twist) * x_axis + np.cos(twist) * y_axis
     return np.column_stack((_unit(x_twisted), _unit(y_twisted), z_axis))
+
+
+def _section_lcs_basis(twist_deg, rotorspin):
+    """Build the planar section LCS used by HomoGen."""
+
+    twist = np.deg2rad(-rotorspin * twist_deg)
+    x_axis = np.array([np.cos(twist), np.sin(twist), 0.0])
+    y_axis = np.array([-np.sin(twist), np.cos(twist), 0.0])
+    z_axis = np.array([0.0, 0.0, 1.0])
+    return np.column_stack((x_axis, y_axis, z_axis))
 
 
 def _elastic_definition(material):

@@ -125,19 +125,27 @@ def test_get_detailed_cross_section_has_shell_and_web_regions():
     assert "lcs" in section.station_frame
 
 
-def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
+def test_station_frame_definition_contains_planar_lcs_and_reference_lcs():
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
 
     frame = station_frame_definition(blade, 10)
-    basis = np.column_stack(
+    section_basis = np.column_stack(
         (
             frame["lcs"]["x_axis"],
             frame["lcs"]["y_axis"],
             frame["lcs"]["z_axis"],
         )
     )
+    reference_basis = np.column_stack(
+        (
+            frame["reference_lcs"]["x_axis"],
+            frame["reference_lcs"]["y_axis"],
+            frame["reference_lcs"]["z_axis"],
+        )
+    )
 
     assert frame["station"] == 10
+    assert "reference_axis" not in frame
     np.testing.assert_allclose(frame["origin"], [0.0, blade.geometry.iprebend[10], blade.ispan[10]])
     assert frame["origin_units"] == "m"
     np.testing.assert_allclose(frame["section_translation"], [0.0, 0.0, 0.0])
@@ -149,7 +157,11 @@ def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
         "sweep_slope",
     }
     assert abs(frame["rotations"]["twist_deg"] - blade.geometry.idegreestwist[10]) < 1e-12
-    np.testing.assert_allclose(basis.T @ basis, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(section_basis.T @ section_basis, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(reference_basis.T @ reference_basis, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(section_basis[2, :2], [0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(section_basis[:, 2], [0.0, 0.0, 1.0], atol=1e-12)
+    assert abs(reference_basis[2, 2] - 1.0) > 1e-6
 
 
 def test_cs_params_geometry_scaling_scales_station_frame_origin():
@@ -169,7 +181,6 @@ def test_cs_params_geometry_scaling_scales_station_frame_origin():
     )
     assert mm_section.station_frame["span"] == 1000.0 * meter_section.station_frame["span"]
     assert mm_section.station_frame["origin_units"] == "mm"
-    assert mm_section.station_frame["reference_axis"]["units"] == "mm"
 
 
 def test_arbitrary_geometry_scaling_uses_scaled_station_frame_units():
@@ -184,7 +195,6 @@ def test_arbitrary_geometry_scaling_uses_scaled_station_frame_units():
 
     assert section.station_frame["geometry_scaling"] == 25.0
     assert section.station_frame["origin_units"] == "scaled"
-    assert section.station_frame["reference_axis"]["units"] == "scaled"
 
 
 def test_freecad_direct_api_is_importable_without_freecad():
@@ -1307,13 +1317,40 @@ def test_move_le_to_origin_shifts_station_frame_by_section_translation():
         np.array(unshifted.station_frame["origin"]) + translation,
     )
     np.testing.assert_allclose(
-        [
-            shifted.station_frame["reference_axis"]["x"],
-            shifted.station_frame["reference_axis"]["y"],
-            shifted.station_frame["reference_axis"]["z"],
-        ],
+        shifted.station_frame["lcs"]["origin"],
         shifted.station_frame["origin"],
     )
+    np.testing.assert_allclose(
+        shifted.station_frame["reference_lcs"]["origin"],
+        shifted.station_frame["origin"],
+    )
+
+
+def test_station_20_homogen_lcs_keeps_section_in_xy_plane():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        20,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+    basis = np.column_stack(
+        (
+            section.station_frame["lcs"]["x_axis"],
+            section.station_frame["lcs"]["y_axis"],
+            section.station_frame["lcs"]["z_axis"],
+        )
+    )
+    points = np.vstack((section.hp_points, section.lp_points))
+    origin = np.array(section.station_frame["origin"])
+    transformed_points = origin + points @ basis.T
+    local_points = (transformed_points - origin) @ basis
+
+    np.testing.assert_allclose(points[:, 2], 0.0, atol=1e-12)
+    np.testing.assert_allclose(local_points[:, 2], 0.0, atol=1e-9)
+    np.testing.assert_allclose(basis[2, :2], [0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(basis[:, 2], [0.0, 0.0, 1.0], atol=1e-12)
 
 
 def test_write_detailed_script_uses_cs_params_geometry_scaling_for_laminates(tmp_path):
