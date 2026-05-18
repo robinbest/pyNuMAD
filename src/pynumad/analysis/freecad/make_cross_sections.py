@@ -2196,6 +2196,12 @@ def _perimeter_shell_regions(
                 _is_closed_polyline(combined_outer),
             )
             inner_segment = _remove_endpoint_backtracking_points(inner_segment)
+            # Very short terminal segments can appear after offsetting sharp LE
+            # curves.  They preserve the requested offset distance, but FreeCAD's
+            # interpolated B-splines can overshoot them visually.  Remove only
+            # sub-15% end segments before this curve becomes the next layer's
+            # outer boundary, so adjacent-layer topology remains exact.
+            inner_segment = _remove_short_endpoint_segments(inner_segment)
             if stack_name_counts[(sides[i_segment], stack.name)] > 1 and (i_segment == 0 or i_segment == len(stacks) - 1):
                 outer_segment = np.vstack((outer_segment[0], outer_segment[-1]))
                 inner_segment = np.vstack((inner_segment[0], inner_segment[-1]))
@@ -2688,6 +2694,32 @@ def _remove_endpoint_backtracking_points(points, tolerance=1e-9):
     points = _remove_start_backtracking_points(points, tolerance)
     points = np.flip(_remove_start_backtracking_points(np.flip(points, axis=0), tolerance), axis=0)
     return points
+
+
+def _remove_short_endpoint_segments(points, relative_limit=0.15, tolerance=1e-9):
+    """Drop tiny terminal curve segments that destabilize spline interpolation.
+
+    ``relative_limit`` compares the end segment length to its neighboring
+    segment.  The default 15% is intentionally conservative: it removes the
+    sub-millimeter LE artifacts observed in station 15 without simplifying
+    ordinary curve sampling along the shell.
+    """
+
+    points = _remove_short_start_segment(points, relative_limit, tolerance)
+    points = np.flip(_remove_short_start_segment(np.flip(points, axis=0), relative_limit, tolerance), axis=0)
+    return points
+
+
+def _remove_short_start_segment(points, relative_limit, tolerance):
+    points = list(points)
+    while len(points) > 3:
+        first_length = np.linalg.norm(points[1] - points[0])
+        next_length = np.linalg.norm(points[2] - points[1])
+        if first_length > tolerance and first_length < relative_limit * max(next_length, tolerance):
+            points.pop(1)
+            continue
+        break
+    return np.array(points)
 
 
 def _remove_start_backtracking_points(points, tolerance):

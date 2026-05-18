@@ -1353,6 +1353,31 @@ def test_station_20_homogen_lcs_keeps_section_in_xy_plane():
     np.testing.assert_allclose(basis[:, 2], [0.0, 0.0, 1.0], atol=1e-12)
 
 
+def test_station_15_le_inner_boundaries_do_not_keep_tiny_endpoint_segments():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    total_stations = np.asarray(blade.ispan).size
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "adhesive_mat_name": "Adhesive",
+        "web_fore_adhesive_thickness": np.full((total_stations,), 0.001),
+        "web_aft_adhesive_thickness": np.full((total_stations,), 0.001),
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 15, move_le_to_origin=True, cs_params=cs_params)
+    hp_layer02 = next(region for region in section.regions if region.name == "Station015_HP_05_15_HP_LE_layer02")
+    hp_layer03 = next(region for region in section.regions if region.name == "Station015_HP_05_15_HP_LE_layer03")
+    lp_layer02 = next(region for region in section.regions if region.name == "Station015_LP_06_15_LP_LE_layer02")
+    lp_layer03 = next(region for region in section.regions if region.name == "Station015_LP_06_15_LP_LE_layer03")
+
+    assert np.allclose(hp_layer02.inner_points, hp_layer03.outer_points)
+    assert np.allclose(lp_layer02.inner_points, lp_layer03.outer_points)
+    assert _endpoint_segment_ratio(hp_layer03.inner_points, "end") > 0.15
+    assert _endpoint_segment_ratio(lp_layer03.inner_points, "start") > 0.15
+
+
 def test_write_detailed_script_uses_cs_params_geometry_scaling_for_laminates(tmp_path):
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
 
@@ -1408,6 +1433,15 @@ def _web_layer_centers(web_layer):
         lp_edge = web_layer.edge_points[2]
         return hp_edge.mean(axis=0), lp_edge.mean(axis=0)
     return (web_layer.points[0] + web_layer.points[3]) / 2, (web_layer.points[1] + web_layer.points[2]) / 2
+
+
+def _endpoint_segment_ratio(points, end):
+    segment_lengths = np.linalg.norm(np.diff(points[:, :2], axis=0), axis=1)
+    if end == "start":
+        return segment_lengths[0] / segment_lengths[1]
+    if end == "end":
+        return segment_lengths[-1] / segment_lengths[-2]
+    raise ValueError(f"Unknown end: {end}")
 
 
 def _web_adhesive_cs_params(blade):
