@@ -2406,7 +2406,12 @@ def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, t
         if gap > tolerance:
             connector = region.start_connector if connector_end == "start" else region.end_connector
             connector_length = _polyline_lengths(connector)[-1] if connector is not None and len(connector) >= 2 else 0.0
-            if len(points) == 1 and layer > 0 and gap <= max(1e-3, 2.0 * connector_length):
+            # When layer00 gelcoat is skipped, the first emitted shell edge can
+            # start just inside the adhesive cut.  Accept only a small fraction
+            # of the connector length; a looser check can jump to a neighboring
+            # TE-flat connector at tapered stations and make the adhesive
+            # overlap shell faces.
+            if len(points) == 1 and layer > 0 and gap <= max(1e-3, 0.25 * connector_length):
                 points.append(region_outer_point)
             else:
                 continue

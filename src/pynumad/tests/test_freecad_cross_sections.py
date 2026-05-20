@@ -1101,6 +1101,33 @@ def test_modified_blade_station_005_trailing_edge_adhesive_uses_small_gap():
     assert not _has_self_intersection(_region_polygon(te_adhesive))
 
 
+def test_iea_station_002_trailing_edge_adhesive_uses_trimmed_flat_edge():
+    blade = pynumad.Blade("examples/example_data/IEA-15-240-RWT.yaml")
+    total_stations = np.asarray(blade.ispan).size
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "adhesive_mat_name": "Adhesive",
+        "web_fore_adhesive_thickness": np.full((total_stations,), 0.001),
+        "web_aft_adhesive_thickness": np.full((total_stations,), 0.001),
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 2, move_le_to_origin=True, cs_params=cs_params)
+    te_adhesive = next(region for region in section.regions if region.name == "Station002_TE_adhesive")
+    lp_flat_layer01 = next(region for region in section.regions if region.name == "Station002_LP_11_02_LP_TE_FLAT_layer01")
+    lp_flat_layer02 = next(region for region in section.regions if region.name == "Station002_LP_11_02_LP_TE_FLAT_layer02")
+    lp_te_reinf_layer01 = next(region for region in section.regions if region.name == "Station002_LP_10_02_LP_TE_REINF_layer01")
+    lp_te_reinf_layer02 = next(region for region in section.regions if region.name == "Station002_LP_10_02_LP_TE_REINF_layer02")
+
+    assert _region_boundary_contains_points(te_adhesive, lp_flat_layer01.end_connector)
+    assert _region_boundary_contains_points(te_adhesive, lp_flat_layer02.end_connector)
+    assert not _region_boundary_contains_points(te_adhesive, lp_te_reinf_layer01.end_connector)
+    assert not _region_boundary_contains_points(te_adhesive, lp_te_reinf_layer02.end_connector)
+    assert not _has_self_intersection(_region_polygon(te_adhesive))
+
+
 def test_iea_flatback_station_uses_flatback_trailing_edge_adhesive():
     blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
 
