@@ -148,8 +148,10 @@ def get_cross_section(
         chord = geometry.ichord[station] * geometry_scaling
         xyz = xyz / chord
 
+    section_translation = np.zeros(3)
     if move_le_to_origin:
-        xyz = xyz - xyz[i_le - 1, :]
+        section_translation = -xyz[i_le - 1, :]
+        xyz = xyz + section_translation
 
     hp_points = xyz[1:i_le, :]
     lp_points = np.flip(xyz, axis=0)[1:i_le, :]
@@ -159,7 +161,12 @@ def get_cross_section(
         te_point=xyz[0, :],
         hp_points=hp_points,
         lp_points=lp_points,
-        station_frame=station_frame_definition(blade, station),
+        station_frame=station_frame_definition(
+            blade,
+            station,
+            geometry_scaling=geometry_scaling,
+            section_translation=section_translation,
+        ),
     )
 
 
@@ -181,6 +188,7 @@ def get_detailed_cross_section(
     """
 
     geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
+    move_le_to_origin = _cs_move_le_to_origin(move_le_to_origin, cs_params)
     section = get_cross_section(
         blade,
         station,
@@ -242,6 +250,7 @@ def write_freecad_cross_sections(
     out_dir = Path(directory).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
+    move_le_to_origin = _cs_move_le_to_origin(move_le_to_origin, cs_params)
 
     section_builder = get_detailed_cross_section if detailed else get_cross_section
     sections = []
@@ -325,6 +334,7 @@ def make_freecad_cross_section_parts(
         doc = App.ActiveDocument or App.newDocument("pyNuMAD_cross_sections")
 
     geometry_scaling = _cs_geometry_scaling(geometry_scaling, cs_params)
+    move_le_to_origin = _cs_move_le_to_origin(move_le_to_origin, cs_params)
     material_table = material_definitions(blade) if detailed else []
     laminate_table = (
         global_laminate_definitions(
@@ -436,6 +446,14 @@ def _cs_geometry_scaling(geometry_scaling, cs_params):
     if cs_params and cs_params.get("geometry_scaling") is not None:
         return float(cs_params["geometry_scaling"])
     return geometry_scaling
+
+
+def _cs_move_le_to_origin(move_le_to_origin, cs_params):
+    """Return LE-origin translation setting, allowing ``cs_params`` to override it."""
+
+    if cs_params and cs_params.get("move_le_to_origin") is not None:
+        return bool(cs_params["move_le_to_origin"])
+    return move_le_to_origin
 
 
 def make_freecad_section_part(
@@ -1050,25 +1068,20 @@ def get_yaml_station_count(yaml_path):
     return yaml_station_count(yaml_path)
 
 
-def station_frame_definition(blade, station):
+def station_frame_definition(blade, station, *, geometry_scaling=1.0, section_translation=None):
     """Return reference-axis orientation data for one blade station.
 
     WindIO stores the blade generating line in
     ``outer_shape_bem.reference_axis.x/y/z`` and the section twist in
     ``outer_shape_bem.twist``.  pyNuMAD imports those as sweep/prebend/span and
-    twist arrays.  This table keeps the physical reference-axis origin and a
-    right-handed local coordinate system so downstream tools can place a 2D
-    cross section in the curved/twisted blade frame.
-
-    The frame data always come from ``outer_shape_bem.reference_axis`` and use
-    a right-handed convention: ``z_axis`` follows the reference-axis tangent,
-    while ``x_axis``/``y_axis`` are twisted about ``z_axis``.  Those constants
-    are documented here instead of repeated in every station's JSON output.
+    twist arrays.  This table keeps the physical station origin, a planar
+    section LCS for HomoGen, and the swept/prebent reference-axis LCS for tools
+    that need the full blade-frame orientation.
     """
 
     geometry = blade.geometry
     span = np.asarray(blade.definition.ispan, dtype=float)
-    origin = np.array(
+    origin_m = np.array(
         [
             -blade.definition.rotorspin * geometry.isweep[station],
             geometry.iprebend[station],
@@ -1076,22 +1089,22 @@ def station_frame_definition(blade, station):
         ],
         dtype=float,
     )
+    section_translation = np.zeros(3) if section_translation is None else np.asarray(section_translation, dtype=float)
+    origin = origin_m * geometry_scaling + section_translation
+    units = _scaled_length_units(geometry_scaling)
     dx_dz = _station_derivative(span, -blade.definition.rotorspin * geometry.isweep, station)
     dy_dz = _station_derivative(span, geometry.iprebend, station)
     twist_deg = float(geometry.idegreestwist[station])
-    basis = _station_lcs_basis(dx_dz, dy_dz, twist_deg, blade.definition.rotorspin)
+    reference_basis = _station_lcs_basis(dx_dz, dy_dz, twist_deg, blade.definition.rotorspin)
+    section_basis = _section_lcs_basis(twist_deg, blade.definition.rotorspin)
 
     return {
         "station": int(station),
-        "span": _json_value(span[station]),
+        "span": _json_value(span[station] * geometry_scaling),
         "origin": _json_value(origin),
-        "origin_units": "m",
-        "reference_axis": {
-            "x": _json_value(origin[0]),
-            "y": _json_value(origin[1]),
-            "z": _json_value(origin[2]),
-            "units": "m",
-        },
+        "origin_units": units,
+        "geometry_scaling": _json_value(float(geometry_scaling)),
+        "section_translation": _json_value(section_translation),
         "rotations": {
             "prebend_angle_deg": _json_value(np.rad2deg(np.arctan2(dy_dz, 1.0))),
             "sweep_angle_deg": _json_value(np.rad2deg(np.arctan2(dx_dz, 1.0))),
@@ -1101,11 +1114,27 @@ def station_frame_definition(blade, station):
         },
         "lcs": {
             "origin": _json_value(origin),
-            "x_axis": _json_value(basis[:, 0]),
-            "y_axis": _json_value(basis[:, 1]),
-            "z_axis": _json_value(basis[:, 2]),
+            "x_axis": _json_value(section_basis[:, 0]),
+            "y_axis": _json_value(section_basis[:, 1]),
+            "z_axis": _json_value(section_basis[:, 2]),
+        },
+        "reference_lcs": {
+            "origin": _json_value(origin),
+            "x_axis": _json_value(reference_basis[:, 0]),
+            "y_axis": _json_value(reference_basis[:, 1]),
+            "z_axis": _json_value(reference_basis[:, 2]),
         },
     }
+
+
+def _scaled_length_units(geometry_scaling):
+    """Return a human-readable unit label for scaled meter coordinates."""
+
+    if np.isclose(geometry_scaling, 1.0):
+        return "m"
+    if np.isclose(geometry_scaling, 1000.0):
+        return "mm"
+    return "scaled"
 
 
 def _station_derivative(span, values, station):
@@ -1140,6 +1169,16 @@ def _station_lcs_basis(dx_dz, dy_dz, twist_deg, rotorspin):
     x_twisted = np.cos(twist) * x_axis + np.sin(twist) * y_axis
     y_twisted = -np.sin(twist) * x_axis + np.cos(twist) * y_axis
     return np.column_stack((_unit(x_twisted), _unit(y_twisted), z_axis))
+
+
+def _section_lcs_basis(twist_deg, rotorspin):
+    """Build the planar section LCS used by HomoGen."""
+
+    twist = np.deg2rad(-rotorspin * twist_deg)
+    x_axis = np.array([np.cos(twist), np.sin(twist), 0.0])
+    y_axis = np.array([-np.sin(twist), np.cos(twist), 0.0])
+    z_axis = np.array([0.0, 0.0, 1.0])
+    return np.column_stack((x_axis, y_axis, z_axis))
 
 
 def _elastic_definition(material):
@@ -2157,6 +2196,12 @@ def _perimeter_shell_regions(
                 _is_closed_polyline(combined_outer),
             )
             inner_segment = _remove_endpoint_backtracking_points(inner_segment)
+            # Very short terminal segments can appear after offsetting sharp LE
+            # curves.  They preserve the requested offset distance, but FreeCAD's
+            # interpolated B-splines can overshoot them visually.  Remove only
+            # sub-15% end segments before this curve becomes the next layer's
+            # outer boundary, so adjacent-layer topology remains exact.
+            inner_segment = _remove_short_endpoint_segments(inner_segment)
             if stack_name_counts[(sides[i_segment], stack.name)] > 1 and (i_segment == 0 or i_segment == len(stacks) - 1):
                 outer_segment = np.vstack((outer_segment[0], outer_segment[-1]))
                 inner_segment = np.vstack((inner_segment[0], inner_segment[-1]))
@@ -2361,7 +2406,12 @@ def _shell_cut_connector(shell_regions, outer_point, connector_end, side=None, t
         if gap > tolerance:
             connector = region.start_connector if connector_end == "start" else region.end_connector
             connector_length = _polyline_lengths(connector)[-1] if connector is not None and len(connector) >= 2 else 0.0
-            if len(points) == 1 and layer > 0 and gap <= max(1e-3, 2.0 * connector_length):
+            # When layer00 gelcoat is skipped, the first emitted shell edge can
+            # start just inside the adhesive cut.  Accept only a small fraction
+            # of the connector length; a looser check can jump to a neighboring
+            # TE-flat connector at tapered stations and make the adhesive
+            # overlap shell faces.
+            if len(points) == 1 and layer > 0 and gap <= max(1e-3, 0.25 * connector_length):
                 points.append(region_outer_point)
             else:
                 continue
@@ -2649,6 +2699,32 @@ def _remove_endpoint_backtracking_points(points, tolerance=1e-9):
     points = _remove_start_backtracking_points(points, tolerance)
     points = np.flip(_remove_start_backtracking_points(np.flip(points, axis=0), tolerance), axis=0)
     return points
+
+
+def _remove_short_endpoint_segments(points, relative_limit=0.15, tolerance=1e-9):
+    """Drop tiny terminal curve segments that destabilize spline interpolation.
+
+    ``relative_limit`` compares the end segment length to its neighboring
+    segment.  The default 15% is intentionally conservative: it removes the
+    sub-millimeter LE artifacts observed in station 15 without simplifying
+    ordinary curve sampling along the shell.
+    """
+
+    points = _remove_short_start_segment(points, relative_limit, tolerance)
+    points = np.flip(_remove_short_start_segment(np.flip(points, axis=0), relative_limit, tolerance), axis=0)
+    return points
+
+
+def _remove_short_start_segment(points, relative_limit, tolerance):
+    points = list(points)
+    while len(points) > 3:
+        first_length = np.linalg.norm(points[1] - points[0])
+        next_length = np.linalg.norm(points[2] - points[1])
+        if first_length > tolerance and first_length < relative_limit * max(next_length, tolerance):
+            points.pop(1)
+            continue
+        break
+    return np.array(points)
 
 
 def _remove_start_backtracking_points(points, tolerance):

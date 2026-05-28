@@ -125,20 +125,30 @@ def test_get_detailed_cross_section_has_shell_and_web_regions():
     assert "lcs" in section.station_frame
 
 
-def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
+def test_station_frame_definition_contains_planar_lcs_and_reference_lcs():
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
 
     frame = station_frame_definition(blade, 10)
-    basis = np.column_stack(
+    section_basis = np.column_stack(
         (
             frame["lcs"]["x_axis"],
             frame["lcs"]["y_axis"],
             frame["lcs"]["z_axis"],
         )
     )
+    reference_basis = np.column_stack(
+        (
+            frame["reference_lcs"]["x_axis"],
+            frame["reference_lcs"]["y_axis"],
+            frame["reference_lcs"]["z_axis"],
+        )
+    )
 
     assert frame["station"] == 10
+    assert "reference_axis" not in frame
     np.testing.assert_allclose(frame["origin"], [0.0, blade.geometry.iprebend[10], blade.ispan[10]])
+    assert frame["origin_units"] == "m"
+    np.testing.assert_allclose(frame["section_translation"], [0.0, 0.0, 0.0])
     assert set(frame["rotations"]) == {
         "prebend_angle_deg",
         "sweep_angle_deg",
@@ -147,7 +157,44 @@ def test_station_frame_definition_contains_reference_axis_rotations_and_lcs():
         "sweep_slope",
     }
     assert abs(frame["rotations"]["twist_deg"] - blade.geometry.idegreestwist[10]) < 1e-12
-    np.testing.assert_allclose(basis.T @ basis, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(section_basis.T @ section_basis, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(reference_basis.T @ reference_basis, np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(section_basis[2, :2], [0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(section_basis[:, 2], [0.0, 0.0, 1.0], atol=1e-12)
+    assert abs(reference_basis[2, 2] - 1.0) > 1e-6
+
+
+def test_cs_params_geometry_scaling_scales_station_frame_origin():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    meter_section = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    mm_section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    np.testing.assert_allclose(
+        mm_section.station_frame["origin"],
+        1000.0 * np.array(meter_section.station_frame["origin"]),
+    )
+    assert mm_section.station_frame["span"] == 1000.0 * meter_section.station_frame["span"]
+    assert mm_section.station_frame["origin_units"] == "mm"
+
+
+def test_arbitrary_geometry_scaling_uses_scaled_station_frame_units():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 25.0},
+    )
+
+    assert section.station_frame["geometry_scaling"] == 25.0
+    assert section.station_frame["origin_units"] == "scaled"
 
 
 def test_freecad_direct_api_is_importable_without_freecad():
@@ -1054,6 +1101,33 @@ def test_modified_blade_station_005_trailing_edge_adhesive_uses_small_gap():
     assert not _has_self_intersection(_region_polygon(te_adhesive))
 
 
+def test_iea_station_002_trailing_edge_adhesive_uses_trimmed_flat_edge():
+    blade = pynumad.Blade("examples/example_data/IEA-15-240-RWT.yaml")
+    total_stations = np.asarray(blade.ispan).size
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "adhesive_mat_name": "Adhesive",
+        "web_fore_adhesive_thickness": np.full((total_stations,), 0.001),
+        "web_aft_adhesive_thickness": np.full((total_stations,), 0.001),
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 2, move_le_to_origin=True, cs_params=cs_params)
+    te_adhesive = next(region for region in section.regions if region.name == "Station002_TE_adhesive")
+    lp_flat_layer01 = next(region for region in section.regions if region.name == "Station002_LP_11_02_LP_TE_FLAT_layer01")
+    lp_flat_layer02 = next(region for region in section.regions if region.name == "Station002_LP_11_02_LP_TE_FLAT_layer02")
+    lp_te_reinf_layer01 = next(region for region in section.regions if region.name == "Station002_LP_10_02_LP_TE_REINF_layer01")
+    lp_te_reinf_layer02 = next(region for region in section.regions if region.name == "Station002_LP_10_02_LP_TE_REINF_layer02")
+
+    assert _region_boundary_contains_points(te_adhesive, lp_flat_layer01.end_connector)
+    assert _region_boundary_contains_points(te_adhesive, lp_flat_layer02.end_connector)
+    assert not _region_boundary_contains_points(te_adhesive, lp_te_reinf_layer01.end_connector)
+    assert not _region_boundary_contains_points(te_adhesive, lp_te_reinf_layer02.end_connector)
+    assert not _has_self_intersection(_region_polygon(te_adhesive))
+
+
 def test_iea_flatback_station_uses_flatback_trailing_edge_adhesive():
     blade = pynumad.Blade("examples/example_data/IEA-22-280-RWT.yaml")
 
@@ -1224,6 +1298,113 @@ def test_cs_params_geometry_scaling_generates_millimeter_sections():
     assert np.isclose(mm_region.plies[0]["thickness"], 1000.0 * meter_region.plies[0]["thickness"])
 
 
+def test_cs_params_move_le_to_origin_overrides_function_argument():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0, "move_le_to_origin": False},
+    )
+
+    assert not np.allclose(section.hp_points[-1, :2], [0.0, 0.0])
+
+
+def test_move_le_to_origin_false_keeps_station_coordinates():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    shifted = get_detailed_cross_section(blade, 10, move_le_to_origin=True)
+    unshifted = get_detailed_cross_section(blade, 10, move_le_to_origin=False)
+
+    assert np.allclose(shifted.hp_points[-1, :2], [0.0, 0.0])
+    assert not np.allclose(unshifted.hp_points[-1, :2], [0.0, 0.0])
+
+
+def test_move_le_to_origin_shifts_station_frame_by_section_translation():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    unshifted = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=False,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+    shifted = get_detailed_cross_section(
+        blade,
+        10,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+
+    translation = np.array(shifted.station_frame["section_translation"])
+    np.testing.assert_allclose(translation, -unshifted.hp_points[-1])
+    np.testing.assert_allclose(
+        shifted.station_frame["origin"],
+        np.array(unshifted.station_frame["origin"]) + translation,
+    )
+    np.testing.assert_allclose(
+        shifted.station_frame["lcs"]["origin"],
+        shifted.station_frame["origin"],
+    )
+    np.testing.assert_allclose(
+        shifted.station_frame["reference_lcs"]["origin"],
+        shifted.station_frame["origin"],
+    )
+
+
+def test_station_20_homogen_lcs_keeps_section_in_xy_plane():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+
+    section = get_detailed_cross_section(
+        blade,
+        20,
+        move_le_to_origin=True,
+        cs_params={"geometry_scaling": 1000.0},
+    )
+    basis = np.column_stack(
+        (
+            section.station_frame["lcs"]["x_axis"],
+            section.station_frame["lcs"]["y_axis"],
+            section.station_frame["lcs"]["z_axis"],
+        )
+    )
+    points = np.vstack((section.hp_points, section.lp_points))
+    origin = np.array(section.station_frame["origin"])
+    transformed_points = origin + points @ basis.T
+    local_points = (transformed_points - origin) @ basis
+
+    np.testing.assert_allclose(points[:, 2], 0.0, atol=1e-12)
+    np.testing.assert_allclose(local_points[:, 2], 0.0, atol=1e-9)
+    np.testing.assert_allclose(basis[2, :2], [0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(basis[:, 2], [0.0, 0.0, 1.0], atol=1e-12)
+
+
+def test_station_15_le_inner_boundaries_do_not_keep_tiny_endpoint_segments():
+    blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
+    total_stations = np.asarray(blade.ispan).size
+    cs_params = {
+        "geometry_scaling": 1000.0,
+        "adhesive_mat_name": "Adhesive",
+        "web_fore_adhesive_thickness": np.full((total_stations,), 0.001),
+        "web_aft_adhesive_thickness": np.full((total_stations,), 0.001),
+        "shell_component_adhesive_width": 0.001,
+        "shell_component_adhesive_mat_name": "Adhesive",
+        "skip_shell_gelcoat_layer": True,
+    }
+
+    section = get_detailed_cross_section(blade, 15, move_le_to_origin=True, cs_params=cs_params)
+    hp_layer02 = next(region for region in section.regions if region.name == "Station015_HP_05_15_HP_LE_layer02")
+    hp_layer03 = next(region for region in section.regions if region.name == "Station015_HP_05_15_HP_LE_layer03")
+    lp_layer02 = next(region for region in section.regions if region.name == "Station015_LP_06_15_LP_LE_layer02")
+    lp_layer03 = next(region for region in section.regions if region.name == "Station015_LP_06_15_LP_LE_layer03")
+
+    assert np.allclose(hp_layer02.inner_points, hp_layer03.outer_points)
+    assert np.allclose(lp_layer02.inner_points, lp_layer03.outer_points)
+    assert _endpoint_segment_ratio(hp_layer03.inner_points, "end") > 0.15
+    assert _endpoint_segment_ratio(lp_layer03.inner_points, "start") > 0.15
+
+
 def test_write_detailed_script_uses_cs_params_geometry_scaling_for_laminates(tmp_path):
     blade = pynumad.Blade("examples/example_data/myBlade_Modified.yaml")
 
@@ -1279,6 +1460,15 @@ def _web_layer_centers(web_layer):
         lp_edge = web_layer.edge_points[2]
         return hp_edge.mean(axis=0), lp_edge.mean(axis=0)
     return (web_layer.points[0] + web_layer.points[3]) / 2, (web_layer.points[1] + web_layer.points[2]) / 2
+
+
+def _endpoint_segment_ratio(points, end):
+    segment_lengths = np.linalg.norm(np.diff(points[:, :2], axis=0), axis=1)
+    if end == "start":
+        return segment_lengths[0] / segment_lengths[1]
+    if end == "end":
+        return segment_lengths[-1] / segment_lengths[-2]
+    raise ValueError(f"Unknown end: {end}")
 
 
 def _web_adhesive_cs_params(blade):
